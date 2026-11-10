@@ -1,0 +1,149 @@
+# Tufa only; upstream (radixark/miles) has no such file. Same workflow as rave's claude-review.yml.
+#
+# Claude reviews a pull request when it is ready for review, then only the new commits on each
+# later push. Drafts are never reviewed: marking a PR ready is the review request.
+# What the reviewer looks for: .claude/rules/tufa-fork.md, then REVIEW.md.
+#
+# Auth: CLAUDE_CODE_OAUTH_TOKEN is a `claude setup-token` token from the team's review account.
+# Comments are posted by the Claude GitHub App, which must be installed on this repository.
+# The job posts a "reviewed up to <sha>" comment; that comment is how the next run knows where
+# to start. Delete it to get a full review on the next push.
+#
+# The Claude App only runs a workflow file that is identical to the one on the default branch,
+# which is why the default branch is tufa/main and not the upstream mirror. On a PR that edits
+# this file the review steps skip themselves with a warning and nothing is recorded: such a PR
+# is reviewed by hand, and the change is tested on the next PR after it merges.
+name: tufa-claude-review
+
+on:
+  pull_request:
+    types: [opened, ready_for_review, reopened, synchronize]
+
+concurrency:
+  group: tufa-claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    env:
+      PR: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      # full: never reviewed. delta: reviewed at an ancestor of the head. rewritten: reviewed at
+      # a commit that is gone (rebase, force push). skip: this head is already reviewed.
+      - name: Decide what to review
+        id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          marker=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
+            --jq '.[] | select(.user.login == "github-actions[bot]") | select(.body | contains("<!-- claude-review-sha:")) | [.id, .body] | @tsv' \
+            | tail -n 1)
+          comment_id=${marker%%$'\t'*}
+          last=$(grep -oE 'claude-review-sha: [0-9a-f]{40}' <<<"$marker" | cut -d' ' -f2 || true)
+          [ -n "$last" ] || comment_id=""
+          if [ -z "$last" ]; then
+            mode="full"
+          elif [ "$last" = "$HEAD_SHA" ]; then
+            mode="skip"
+          elif git cat-file -e "$last^{commit}" 2>/dev/null && git merge-base --is-ancestor "$last" "$HEAD_SHA"; then
+            mode="delta"
+          else
+            mode="rewritten"
+          fi
+          if [ "$mode" = delta ] || [ "$mode" = rewritten ]; then
+            # Earlier inline comments, for the follow-up review to read instead of repeating them.
+            mkdir -p .review-context
+            gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/comments" --paginate \
+              --jq '.[] | "\(.path):\(.line // .original_line) [\(.user.login)] \(.body)\n---"' \
+              > .review-context/earlier-comments.txt
+          fi
+          {
+            echo "mode=$mode"
+            echo "last=$last"
+            echo "comment_id=$comment_id"
+          } >> "$GITHUB_OUTPUT"
+          echo "mode=$mode last=${last:-none} head=$HEAD_SHA"
+
+      - name: First review
+        id: first
+        if: steps.scope.outputs.mode == 'full'
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: "/code-review low --max-findings 10 --comment ${{ github.event.pull_request.number }}"
+          claude_args: |
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git blame:*)"
+            --max-turns 60
+
+      - name: Follow-up review
+        id: followup
+        if: steps.scope.outputs.mode == 'delta' || steps.scope.outputs.mode == 'rewritten'
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+            MODE: ${{ steps.scope.outputs.mode }}
+            LAST REVIEWED COMMIT: ${{ steps.scope.outputs.last }}
+            HEAD COMMIT: ${{ github.event.pull_request.head.sha }}
+
+            You already reviewed this pull request at LAST REVIEWED COMMIT. The author has pushed
+            since. The head is checked out in the working directory. This is a follow-up review:
+            look only at what is new.
+
+            Scope:
+            - MODE delta: review `git diff <LAST REVIEWED COMMIT>..<HEAD COMMIT>`. If the base
+              branch was merged into the branch in that range, ignore what the merge brought in:
+              only hunks that are also in `gh pr diff <PR NUMBER>` belong to this pull request.
+            - MODE rewritten: the branch was rebased or force-pushed, so that range no longer
+              exists. Review `gh pr diff <PR NUMBER>` as a whole.
+            Read the surrounding code as needed to judge a change; do not review code the new
+            commits did not touch.
+
+            Before reporting anything, read `.review-context/earlier-comments.txt`, the inline
+            comments already on this pull request. Never repeat or rephrase an earlier comment,
+            resolved or not. If a new commit claims to fix an earlier finding and does not, say
+            so once, on the line where it still fails.
+
+            Follow `.claude/rules/tufa-fork.md`, then `REVIEW.md`. Report only problems you are
+            confident are real, each with the concrete case in which the code misbehaves. At
+            most 5 findings.
+
+            Post each finding as an inline comment with
+            `mcp__github_inline_comment__create_inline_comment` (`confirmed: true`), one per
+            finding, with a suggestion block only when it fixes the problem entirely. Post no
+            summary comment. If there is nothing new to report, post nothing.
+          claude_args: |
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git blame:*)"
+            --max-turns 40
+
+      # `execution_file` is set only when Claude ran, not when the action skipped itself.
+      - name: Record the reviewed commit
+        if: steps.first.outputs.execution_file != '' || steps.followup.outputs.execution_file != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMENT_ID: ${{ steps.scope.outputs.comment_id }}
+        run: |
+          set -euo pipefail
+          body="Claude reviewed this pull request up to ${HEAD_SHA:0:7}. Findings are inline comments; none means nothing to report. Later pushes get a review of the new commits only. For a full pass, comment \`@claude review\`.
+          <!-- claude-review-sha: $HEAD_SHA -->"
+          if [ -n "$COMMENT_ID" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$COMMENT_ID" -f body="$body" --silent
+          else
+            gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR/comments" -f body="$body" --silent
+          fi
