@@ -46,6 +46,11 @@ Views:
 - **Metrics** — a wandb-style category sidebar over every logged metric, plus
   an `sglang` category (scraped engine series) when present; hover for values,
   drag to zoom.
+- **Breakdown** — shown when some metric is logged per label, as keys that
+  differ in one path segment (`train_batch/source_share/<source>`): one bar
+  per label for a chosen family of keys, as the total, the mean or the last
+  value over a step range; keys with two varying segments
+  (`.../<source>/<outcome>`) give stacked bars. The state is in the URL.
 - **Compute Utilization** — per-GPU lanes below 64 GPUs (phase band, NVML
   utilization, sglang overlay, click-to-zoom bubble strip); above that, a
   scale-invariant fleet overview (phase composition + utilization band) with a

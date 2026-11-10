@@ -1,4 +1,5 @@
 import { getMeta, refreshMeta } from "./api.js";
+import { metricFamilies, renderBreakdown } from "./views_breakdown.js";
 import { renderMetrics } from "./views_metrics.js";
 import { renderRollout } from "./views_rollout.js";
 import { renderSandboxes } from "./views_sandboxes.js";
@@ -47,6 +48,16 @@ function parseRoute() {
   if (segments[0] === "timeline") {
     return { view: "timeline", lanes: params.get("lanes") };
   }
+  if (segments[0] === "breakdown") {
+    return {
+      view: "breakdown",
+      family: params.get("family"),
+      aggregate: params.get("agg"),
+      normalize: params.get("norm") === "1",
+      stepFrom: params.get("from"),
+      stepTo: params.get("to"),
+    };
+  }
   if (segments[0] === "sandboxes") {
     return { view: "sandboxes", staleMinutes: params.get("stale_min") };
   }
@@ -77,6 +88,10 @@ function crumbs(route, meta) {
   const nav = (label, href, active, onclick = null) =>
     el("a", { class: `nav${active ? " active" : ""}`, href, onclick }, [label]);
   const parts = [nav("Metrics", "#/", route.view === "metrics")];
+  // shown when some metric is logged per label (see views_breakdown.js)
+  if (metricFamilies(meta.metric_keys).length) {
+    parts.push(nav("Breakdown", "#/breakdown", route.view === "breakdown"));
+  }
   if (meta.capabilities.has_timeline) {
     parts.push(nav("Compute Utilization", "#/timeline", route.view === "timeline"));
   }
@@ -133,6 +148,7 @@ async function render() {
     if (meta.wandb_url) runinfo.push(" · ", el("a", { href: meta.wandb_url, target: "_blank" }, ["wandb ↗"]));
     document.getElementById("runinfo").replaceChildren(...runinfo);
     if (route.view === "metrics") await renderMetrics(view, meta);
+    else if (route.view === "breakdown") await renderBreakdown(view, meta, route);
     else if (route.view === "timeline") await renderTimeline(view, meta, route);
     else if (route.view === "rollout") await renderRollout(view, meta, route);
     else if (route.view === "sandboxes") await renderSandboxes(view, meta, route);

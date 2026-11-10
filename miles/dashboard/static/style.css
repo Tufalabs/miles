@@ -70,6 +70,12 @@ button.active { border-color: var(--accent); color: var(--accent); }
 .keylist label:hover { background: var(--bg); }
 
 canvas.chart { width: 100%; height: 220px; display: block; cursor: crosshair; }
+.bar-row { display: grid; grid-template-columns: minmax(120px, 240px) minmax(0, 1fr) 150px; gap: 10px; align-items: center; padding: 2px 0; font-size: 12px; }
+.bar-label { font-family: ui-monospace, monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: right; }
+.bar-track { display: flex; gap: 2px; height: 14px; }
+.bar-seg { height: 100%; min-width: 1px; border-radius: 0 3px 3px 0; }
+.bar-seg:not(:last-child) { border-radius: 0; }
+.bar-value { font-variant-numeric: tabular-nums; color: var(--muted); white-space: pre; }
 .chart-title { font-size: 13px; color: var(--text); margin: 0 0 4px; font-family: ui-monospace, monospace; }
 
 table.data { border-collapse: collapse; width: 100%; font-size: 13px; font-variant-numeric: tabular-nums; }
