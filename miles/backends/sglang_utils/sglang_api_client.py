@@ -477,6 +477,14 @@ class SGLangApiClient:
         response.raise_for_status()
         return response
 
+    async def get_metrics(self, timeout: float = 5.0) -> str:
+        """The engine's Prometheus /metrics page, as text."""
+        response = await GeneralHttpClientProvider.client().get(
+            f"{self.server_url}/metrics", headers=self._headers, timeout=timeout
+        )
+        response.raise_for_status()
+        return response.text
+
     async def stop_profile(self):
         response = await GeneralHttpClientProvider.client().post(
             f"{self.server_url}/stop_profile", json={}, headers=self._headers

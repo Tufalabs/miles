@@ -142,6 +142,36 @@ class DebugConfig(BaseConfig):
             nargs="+",
         ),
     ] = ["train_overall"]
+    sglang_profile_rollout_ids: A[
+        list[int],
+        Arg(
+            type_parser=int,
+            nargs="*",
+            help=(
+                "Global rollout ids at which the first rollout engine takes a torch profiler trace of "
+                "--sglang-profile-num-steps forward steps, started once the engine is generating, written to "
+                "{sglang-profile-dir}/rollout_{id}/engine_0/."
+            ),
+        ),
+    ] = []
+    sglang_profile_dir: A[
+        str | None,
+        Arg(
+            help=(
+                "Where the --sglang-profile-rollout-ids traces go. The engine process writes them on its own node, "
+                "so use a path on storage every node shares."
+            )
+        ),
+    ] = None
+    sglang_profile_num_steps: A[int, Arg()] = 100
+    sglang_profile_with_stack: A[
+        bool,
+        Arg(help="Record Python stacks in the SGLang traces (about 10x larger)."),
+    ] = False
+    sglang_profile_record_shapes: A[
+        bool,
+        Arg(help="Record operator input shapes in the SGLang traces."),
+    ] = False
     memory_recorder: A[str, Arg(choices=["torch", "memray"])] = "torch"
     check_weight_update_equal: A[bool, Arg()] = False
     check_weight_update_selector: A[

@@ -9,6 +9,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_
 
 from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient
 from miles.dashboard import hooks as dashboard_hooks
+from miles.ray.rollout.engine_profiler import RolloutEngineProfiler
 from miles.ray.rollout.eval_fleet import EvalFleetInfo, EvalFleetPin, InferenceControllerEvalFleet
 from miles.ray.rollout.rollout_server import RolloutServer, create_rollout_servers
 from miles.ray.rollout.router_manager import resolve_router_addrs
@@ -46,6 +47,10 @@ CELLS_READY_TIMEOUT_SECONDS = 3600.0
 
 @enforce_lock_discipline
 class InferenceController:
+    # An SGLang profiler window at --sglang-profile-rollout-ids, only when some are listed. None also for
+    # controllers built without __init__ (the tests' doubles).
+    _engine_profiler: RolloutEngineProfiler | None = None
+
     @lock_exempt
     def __init__(
         self,
@@ -63,6 +68,7 @@ class InferenceController:
         self._eval_fleet: InferenceControllerEvalFleet | None = None
         self._watcher_disposers: list[StopWatchFn] = []
         self._ticker: SimpleTicker | None = None
+        self._engine_profiler = RolloutEngineProfiler(args) if args.sglang_profile_rollout_ids else None
 
     @lock_exempt
     @init_once
@@ -131,6 +137,9 @@ class InferenceController:
     async def prepare_rollout(self, rollout_id: int, model_id: str | None = None) -> None:
         await self._health_monitoring_resume(model_id)
         await dashboard_hooks.register_engines(self.servers, provider=self._engine_provider)
+        if self._engine_profiler is not None and self._engine_profiler.profiles(rollout_id):
+            srv = self._get_updatable_server(model_id=model_id)
+            self._engine_profiler.start(rollout_id, engines=srv.api_clients if srv is not None else [])
 
     @with_lock
     async def prepare_eval(self, model_id: str | None = None) -> None:
@@ -185,6 +194,8 @@ class InferenceController:
 
     @requires_lock
     async def _offload(self, tags: list[str] | None):
+        if self._engine_profiler is not None:
+            await self._engine_profiler.finish()
         await self._health_monitoring_pause(None)
         for srv in self.servers.values():
             await srv.offload(tags=tags)
@@ -223,6 +234,8 @@ class InferenceController:
             if model_id is not None:
                 raise ValueError("Dedicated eval synchronization does not select a training model")
             model_id = "eval"
+        if self._engine_profiler is not None:
+            await self._engine_profiler.finish()
         await self._health_monitoring_pause(model_id)
         await self._ensure_cells_ready(model_id=model_id)
 

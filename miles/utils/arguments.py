@@ -1194,6 +1194,9 @@ def miles_validate_args(args):
         args.dump_details_interval >= 1
     ), f"--dump-details-interval must be at least 1, got {args.dump_details_interval}"
 
+    if args.sglang_profile_rollout_ids:
+        assert args.sglang_profile_dir is not None, "--sglang-profile-rollout-ids needs --sglang-profile-dir"
+
     if args.load_debug_rollout_data is not None:
         logger.info(
             f"load_debug_rollout_data {args.load_debug_rollout_data} is set, "
