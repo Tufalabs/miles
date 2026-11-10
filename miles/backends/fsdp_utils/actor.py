@@ -14,6 +14,8 @@ from miles.backends.training_utils.metrics import train_dump
 from miles.backends.training_utils.parallel import get_parallel_state, set_parallel_state
 from miles.backends.training_utils.torch_native.actor import TorchNativeTrainRayActor
 from miles.backends.training_utils.torch_native.step_runner import LinearStepRunner, StepMetrics
+from miles.backends.training_utils.weight_update.hf_weight_iterator import WeightUpdatePlacement
+from miles.backends.training_utils.weight_update.snapshot_publisher import SnapshotPublisher
 from miles.utils.audit_utils.config_snapshot.dumper import ConfigSnapshotDumper
 from miles.utils.audit_utils.config_snapshot.enabled import SNAPSHOT_TESTING_ENABLED
 from miles.utils.context_utils import with_defer
@@ -158,6 +160,17 @@ class FSDPTrainRayActor(TorchNativeTrainRayActor):
         self.optimizers = [self.optimizer]
 
         self.weight_updater = self._build_weight_updater(self.model, FSDPHfWeightIterator.build)
+        # HF exports stream the same HF-named full tensors the weight sync sends, so export coverage
+        # matches weight-sync coverage.
+        self.snapshot_publisher = SnapshotPublisher(
+            FSDPHfWeightIterator.build(
+                args,
+                self.model,
+                required_placement=WeightUpdatePlacement(gather_pp=True),
+                model_name=self._hf_model_name(),
+                quantization_config=self._hf_quantization_config(),
+            )
+        )
 
         checkpoint.finalize_load(self, checkpoint_payload)
 
@@ -306,6 +319,19 @@ class FSDPTrainRayActor(TorchNativeTrainRayActor):
 
     def _save_checkpoint(self, rollout_id: int) -> None:
         checkpoint.save(self, rollout_id)
+        if self.args.save_hf is not None and self.role == "actor":
+            self.export_hf(rollout_id, self.args.save_hf.format(rollout_id=rollout_id))
+
+    def export_hf(self, rollout_id: int, path: str) -> None:
+        """Export the current weights as an HF checkpoint to ``path`` (collective on every rank).
+
+        Errors propagate, so an eval snapshot that failed to export is skipped loudly. With
+        --offload-train the caller onloads the model first.
+        """
+        self._heartbeat.bump()
+        if dist.get_rank() == 0:
+            logger.info(f"Saving model in HuggingFace format to {path}")
+        self.snapshot_publisher.publish_model(path, hf_checkpoint=self.args.hf_checkpoint)
 
     @contextmanager
     def _ref_context(self):

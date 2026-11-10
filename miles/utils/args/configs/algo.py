@@ -22,7 +22,7 @@ class AlgoConfig(BaseConfig):
         str | None,
         Arg(
             help=(
-                "Path to save the model in HuggingFace format when using Megatron backend. "
+                "Path to save the model in HuggingFace format (Megatron and FSDP backends). "
                 "The model will be saved to `save_hf.format(rollout_id)`. "
             )
         ),

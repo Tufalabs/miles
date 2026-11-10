@@ -93,20 +93,25 @@ class TorchNativeTrainRayActor(TrainRayActor):
     def train_parallel_config(self) -> TrainParallelConfig:
         return get_parallel_state().train_parallel_config(supports_precomputed_schedule=False)
 
+    def _hf_model_name(self) -> str:
+        if self.args.model_name is not None:
+            return self.args.model_name
+        return type(self.hf_config).__name__.lower()
+
+    def _hf_quantization_config(self) -> dict | None:
+        return getattr(
+            self.hf_config, "quantization_config", None
+        )  # config-access-exempt: unquantized HF checkpoints omit quantization_config
+
     def _build_weight_updater(self, model, iterator_factory: Callable) -> WeightUpdater:
         self._published_weight_version = 0
-        model_name = self.args.model_name
-        if model_name is None:
-            model_name = type(self.hf_config).__name__.lower()
         is_lora = lora_rollout_enabled(self.args)
         return WeightUpdater(
             self.args,
             model,
             weights_getter=lambda: None,
-            model_name=model_name,
-            quantization_config=getattr(
-                self.hf_config, "quantization_config", None
-            ),  # config-access-exempt: unquantized HF checkpoints omit quantization_config
+            model_name=self._hf_model_name(),
+            quantization_config=self._hf_quantization_config(),
             iterator_factory=iterator_factory,
             parallel_state=get_parallel_state(),
             is_lora=is_lora,

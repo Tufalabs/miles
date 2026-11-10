@@ -10,6 +10,7 @@ import torch.distributed as dist
 
 from miles.backends.training_utils.checkpoint.io import write_checkpoint_dir
 from miles.backends.training_utils.weight_update.hf_weight_iterator import HfWeightIteratorBase
+from miles.utils.hf_utils.config import HF_EXPORT_COMPLETE_MARKER
 from miles.utils.lora.utils import AdapterSpec, get_adapter_target_modules
 
 logger = logging.getLogger(__name__)
@@ -58,8 +59,23 @@ class SnapshotPublisher:
             (path / "adapter_config.json").write_text(json.dumps(adapter_config))
             (path / "adapter_model.safetensors").write_bytes(adapter_bytes)
 
-    def write_model(self, path: str | Path, *, weights: Mapping[str, torch.Tensor], hf_checkpoint: str) -> None:
-        """Collectively write HF model shards into the caller's checkpoint directory."""
+    def publish_model(self, path: str | Path, *, hf_checkpoint: str) -> None:
+        """Collectively replace ``path`` with an HF checkpoint of the live model weights.
+
+        The ``.complete`` marker lands last, so a reader that waits for it never sees a partial export.
+        Errors propagate on every rank.
+        """
+        write_checkpoint_dir(
+            path,
+            lambda checkpoint_dir: self.write_model(checkpoint_dir, weights=None, hf_checkpoint=hf_checkpoint),
+            completion_marker=HF_EXPORT_COMPLETE_MARKER,
+        )
+
+    def write_model(self, path: str | Path, *, weights: Mapping[str, torch.Tensor] | None, hf_checkpoint: str) -> None:
+        """Collectively write HF model shards into the caller's checkpoint directory.
+
+        ``weights``: backend-native named weights to read; None reads the live model parameters.
+        """
         path = Path(path)
         is_writer = dist.get_rank() == 0
 
