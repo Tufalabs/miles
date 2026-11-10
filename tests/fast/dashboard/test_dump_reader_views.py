@@ -607,3 +607,20 @@ def test_pre_span_dump_survives_the_full_reader_pipeline(tmp_path):
     assert agentic["turns"].min() == 2
     assert agentic["mixed_version"].all()
     assert reader.tokens(0, int(agentic["sample_index"][0]))
+
+
+def test_loss_debug_calls_of_a_rollout_dumped_after_the_first_read(tmp_path):
+    """A dashboard that follows a live run keeps one reader: later rollouts' loss dumps must still be found."""
+    import torch
+
+    loss_dir = tmp_path / "policy_loss_debug"
+    loss_dir.mkdir()
+    torch.save({"rollout_id": 0, "samples": []}, loss_dir / "rank_0_call_0.pt")
+    torch.save({"rollout_id": 0, "samples": []}, loss_dir / "rank_10_call_0.pt")
+    reader = DumpReader(tmp_path)
+    assert len(reader._loss_debug_calls(0, 0)) == 1
+    assert reader._loss_debug_calls(1, 0) == []
+
+    for call_no in (1, 2):
+        torch.save({"rollout_id": 1, "samples": []}, loss_dir / f"rank_0_call_{call_no}.pt")
+    assert len(reader._loss_debug_calls(1, 0)) == 2

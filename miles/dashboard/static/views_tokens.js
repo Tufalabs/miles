@@ -8,6 +8,7 @@ import { renderConversation, renderSampleChips } from "./conversation.js";
 const STATS = {
   imp_ratio: { color: (v) => divergingColor(Math.log(Math.max(v, 1e-6))) },
   lp_diff: { diverging: true },
+  train_rollout_abs_diff: { sequential: true },
   advantages: { diverging: true },
   returns: { diverging: true },
   entropy: { sequential: true },

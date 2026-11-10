@@ -412,6 +412,7 @@ class DumpReader:
         self.dump_dir = Path(dump_dir)
         self.rollout_dir = self.dump_dir / "rollout_data"
         self.train_dir = self.dump_dir / "train_data"
+        self.loss_debug_dir = self.dump_dir / "policy_loss_debug"
         self.cache_dir = Path(cache_dir) if cache_dir is not None else self.dump_dir / "dashboard" / "cache"
         self.tensor_lru = tensor_lru
         self._joined_cache: OrderedDict[tuple[int, bool], JoinedRollout] = OrderedDict()
@@ -454,7 +455,7 @@ class DumpReader:
             index: dict[int, list[tuple[int, int]]] = {}
             raw_reward_column = None
             for shard, path in enumerate(self._train_paths(rollout_id)):
-                rank_pack = self._torch_load(path)
+                rank_pack = self._load_train_pack(path, rollout_id)
                 columns = rank_pack["rollout_data"]
                 raw_rewards = columns.get("raw_reward")
                 if raw_rewards is not None:
@@ -691,7 +692,7 @@ class DumpReader:
             handles: list[dict] = []
             index: dict[int, list[tuple[int, int]]] = {}
             for shard_no, path in enumerate(self._train_paths(rollout_id)):
-                pack = self._torch_load(path, mmap=True)
+                pack = self._load_train_pack(path, rollout_id, mmap=True)
                 for row_no, si in enumerate(pack["rollout_data"]["sample_indices"]):
                     index.setdefault(int(si), []).append((shard_no, row_no))
                 handles.append(pack)
@@ -785,6 +786,7 @@ class DumpReader:
             train_log_probs=None if row is None else response_slice(row.log_probs),
             ref_log_probs=None if row is None else response_slice(row.ref_log_probs),
             lp_diff=response_slice(lp_diff),
+            train_rollout_abs_diff=None if lp_diff is None else response_slice(lp_diff.abs()),
             imp_ratio=None if lp_diff is None else response_slice(lp_diff.exp()),
             entropy=None if row is None else response_slice(row.entropy),
             ref_entropy=None if row is None else response_slice(row.ref_entropy),
@@ -876,6 +878,89 @@ class DumpReader:
             return_mean=_mean(_masked(row.returns, mask)),
             alignment_failed=row.alignment_failed,
         )
+
+    def _load_train_pack(self, path: Path, rollout_id: int, *, mmap: bool = False) -> dict:
+        """A rank's train dump. When the run skipped the separate log-prob pass
+        (`--skip-actor-forward-only`), the dump has no trainer `log_probs`; the
+        loss computed them anyway and wrote them to `policy_loss_debug`, so they
+        are taken from there."""
+        pack = self._torch_load(path, mmap=mmap)
+        columns = pack["rollout_data"]
+        if columns.get("log_probs") is None and (rank := pack.get("rank")) is not None:
+            log_probs = self._loss_debug_log_probs(rollout_id, int(rank), columns)
+            if log_probs is not None:
+                columns["log_probs"] = log_probs
+        return pack
+
+    def _loss_debug_log_probs(self, rollout_id: int, rank: int, columns: dict) -> list[torch.Tensor] | None:
+        """The trainer's per-token log-probs of every row of one rank's train dump,
+        from that rank's `policy_loss_debug` calls for `rollout_id`.
+
+        A rank writes one call per micro-batch, in the order of the train dump's
+        `micro_batch_indices`, and the i-th sample of a call is that micro-batch's
+        i-th row. Lengths and rollout log-probs are checked row by row; any mismatch (several optimizer
+        steps per rollout, a resumed attempt, dumps without rollout ids) returns
+        None rather than a guess."""
+        micro_batches = columns.get("micro_batch_indices")
+        calls = self._loss_debug_calls(rollout_id, rank)
+        if micro_batches is None or not calls or len(calls) != len(micro_batches):
+            return None
+        log_probs: list[torch.Tensor | None] = [None] * len(columns["sample_indices"])
+        reference = columns.get("rollout_log_probs")
+        for call, rows in zip(calls, micro_batches, strict=True):
+            if len(call["samples"]) != len(rows):
+                return None
+            for sample, row in zip(call["samples"], rows, strict=True):
+                values = sample["train_log_probs"]
+                if int(sample["response_length"]) != int(columns["response_lengths"][row]):
+                    return None
+                # the loss saw the same rollout log-probs as the dump: proof the row is the right one
+                if reference is not None and (
+                    len(values) != len(reference[row])
+                    or (
+                        sample.get("rollout_log_probs") is not None
+                        and not torch.equal(sample["rollout_log_probs"], reference[row].float())
+                    )
+                ):
+                    return None
+                log_probs[row] = values
+        return None if any(values is None for values in log_probs) else log_probs
+
+    def _loss_debug_calls(self, rollout_id: int, rank: int) -> list[dict]:
+        """`rank`'s loss dumps for `rollout_id`, in call order. Calls are numbered
+        per process and rollout ids never decrease along them, so a binary search
+        finds the first one without opening the rest. The files are listed on every
+        call, so a dashboard that follows a live run sees the rollouts dumped since
+        the last one. A resumed attempt is not supported: its process numbers its
+        calls from 0 again and overwrites the first files, which breaks that order,
+        and the caller's row checks then return None."""
+        numbered = []
+        if self.loss_debug_dir.is_dir():
+            for path in self.loss_debug_dir.glob(f"rank_{rank}_call_*.pt"):
+                numbered.append((int(path.stem.rsplit("_", 1)[1]), path))
+        paths = [path for _, path in sorted(numbered)]
+
+        def load(i: int) -> dict:
+            return self._torch_load(paths[i], mmap=True)
+
+        def rollout_of(call: dict) -> int:
+            rid = call.get("rollout_id")
+            return -1 if rid is None else int(rid)
+
+        lo, hi = 0, len(paths)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if rollout_of(load(mid)) < rollout_id:
+                lo = mid + 1
+            else:
+                hi = mid
+        calls = []
+        for i in range(lo, len(paths)):
+            call = load(i)
+            if rollout_of(call) != rollout_id:
+                break
+            calls.append(call)
+        return calls
 
     def _train_paths(self, rollout_id: int) -> list[Path]:
         return sorted(self.train_dir.glob(f"{rollout_id}_*.pt"), key=lambda p: int(p.stem.rsplit("_", 1)[1]))
