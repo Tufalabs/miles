@@ -85,10 +85,13 @@ jobs:
     # A PR based on another branch (e.g. a stacked PR) starts CI only while it
     # carries a `run-ci*` label; `"run-ci` in the JSON array matches a label
     # prefix. Every other job needs this one, so skipping it skips the whole run.
+    # `tufa/main` is the branch this fork's own PRs merge into (the default
+    # branch only mirrors upstream), so a PR based on it starts CI as well.
     if: |
       github.event.action != 'closed' &&
       (github.event_name != 'pull_request' ||
         github.event.pull_request.base.ref == github.event.repository.default_branch ||
+        github.event.pull_request.base.ref == 'tufa/main' ||
         contains(toJSON(github.event.pull_request.labels.*.name), '"run-ci'))
     runs-on: ubuntu-latest
     outputs:

@@ -19,7 +19,9 @@ class TestBackendFlopsLogging:
         monkeypatch.setattr(timer, "seq_lens", [4], raising=False)
         logs: list[dict] = []
         monkeypatch.setattr(log_utils.tracking, "log", lambda args, metrics, step_key: logs.append(metrics))
-        args = Namespace(mfu_peak_tflops=100.0, trainer_model_id=None, wandb_always_use_train_step=False)
+        args = Namespace(
+            mfu_peak_tflops=100.0, trainer_model_id=None, wandb_always_use_train_step=False, indep_dp=False
+        )
         seen: list[list[int]] = []
 
         def fwd_tflops(seq_lens: list[int]) -> float:

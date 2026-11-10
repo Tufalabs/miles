@@ -3,6 +3,7 @@ from argparse import Namespace
 from collections.abc import Callable
 from copy import deepcopy
 
+from miles.backends.training_utils.metrics.memory import step_memory_metrics
 from miles.utils.device_flops import local_peak_bf16_tflops
 from miles.utils.metric_utils import compute_rollout_step, namespace_metrics
 from miles.utils.timer import Timer
@@ -24,11 +25,13 @@ def log_perf_data_raw(
     timer_instance = Timer()
     log_dict_raw = deepcopy(timer_instance.log_dict())
     timer_instance.reset()
+    # every rank: the peaks are reduced over them (independent replicas report their own)
+    memory_metrics = step_memory_metrics(reduce_over_ranks=not args.indep_dp)
 
     if not is_primary_rank:
         return
 
-    log_dict = {f"perf/{key}_time": val for key, val in log_dict_raw.items()}
+    log_dict = {f"perf/{key}_time": val for key, val in log_dict_raw.items()} | memory_metrics
     if extra_metrics:
         log_dict.update(extra_metrics)
 

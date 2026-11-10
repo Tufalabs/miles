@@ -30,7 +30,7 @@ def logged(monkeypatch):
 
 
 def make_args(**overrides):
-    defaults = dict(wandb_always_use_train_step=False, mfu_peak_tflops=None, trainer_model_id=None)
+    defaults = dict(wandb_always_use_train_step=False, mfu_peak_tflops=None, trainer_model_id=None, indep_dp=False)
     return SimpleNamespace(**{**defaults, **overrides})
 
 

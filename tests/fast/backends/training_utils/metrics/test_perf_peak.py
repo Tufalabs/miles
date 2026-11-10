@@ -21,7 +21,9 @@ class TestPerformancePeak:
         calls: list[dict[str, float]] = []
         monkeypatch.setattr(perf, "local_peak_bf16_tflops", lambda: detected_peak)
         monkeypatch.setattr(perf.tracking, "log", lambda args, payload, step_key: calls.append(payload))
-        args = Namespace(mfu_peak_tflops=configured_peak, trainer_model_id=None, wandb_always_use_train_step=False)
+        args = Namespace(
+            mfu_peak_tflops=configured_peak, trainer_model_id=None, wandb_always_use_train_step=False, indep_dp=False
+        )
 
         perf.log_perf_data_raw(
             rollout_id=3,
