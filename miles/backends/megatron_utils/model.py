@@ -31,6 +31,7 @@ from miles.backends.training_utils.data.rollout import DataIterator, get_batch
 from miles.backends.training_utils.data.sampling_mask import get_rollout_sampling_masks
 from miles.backends.training_utils.loss.objective import loss_function
 from miles.backends.training_utils.metrics.checks import check_grad_norm, check_kl
+from miles.backends.training_utils.metrics.debug_dump import training_rollout_scope
 from miles.backends.training_utils.metrics.log_utils import (
     aggregate_forward_results,
     aggregate_train_losses,
@@ -602,9 +603,10 @@ def train_one_step(
         fn_args = compute_custom_function_config(args, x)
         custom_before_train_step_hook(fn_args, rollout_id, step_id, model, optimizer, opt_param_scheduler)
 
-    losses_reduced = run_forward_backward_pass(
-        args, dumper_phase_util, data_iterator, model, num_microbatches, num_rollouts
-    )
+    with training_rollout_scope(rollout_id):
+        losses_reduced = run_forward_backward_pass(
+            args, dumper_phase_util, data_iterator, model, num_microbatches, num_rollouts
+        )
     if args.enable_sample_ownership_checker:
         local_consumed_identities = SampleIdentityExtractor.get_consumed_sample_identities(
             start_offset=sample_consumption_start,

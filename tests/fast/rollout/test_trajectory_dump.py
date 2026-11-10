@@ -47,6 +47,7 @@ def dump_args(tmp_path):
     return argparse.Namespace(
         save_debug_rollout_data=str(tmp_path / "rollout_data" / "{rollout_id}.pt"),
         save_debug_trajectory_data=str(tmp_path / "trajectory" / "{rollout_id}.jsonl"),
+        dump_details_interval=1,
     )
 
 

@@ -20,6 +20,7 @@ from miles.backends.training_utils.loss.objective import (
 )
 from miles.backends.training_utils.metrics import perf
 from miles.backends.training_utils.metrics.checks import check_grad_norm
+from miles.backends.training_utils.metrics.debug_dump import training_rollout_scope
 from miles.backends.training_utils.metrics.log_utils import (
     aggregate_forward_results,
     aggregate_train_losses,
@@ -267,9 +268,10 @@ class TorchNativeTrainRayActor(TrainRayActor):
             runner.zero_grad()
             progress = tqdm(range(microbatches), desc="actor_train", disable=dist.get_rank() != 0)
             batches = self._fetch_batches(self.prof.iterate_train_actor(progress), data_iterator, keys)
-            losses_reduced = runner.forward_backward_step(
-                batches, partial(_step_loss, args, microbatches, num_step_tokens[step_id])
-            )
+            with training_rollout_scope(rollout_id):
+                losses_reduced = runner.forward_backward_step(
+                    batches, partial(_step_loss, args, microbatches, num_step_tokens[step_id])
+                )
             metrics = runner.apply_step()
 
             if args.ci_test:

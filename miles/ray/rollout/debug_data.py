@@ -6,6 +6,7 @@ from string import Formatter
 
 import torch
 
+from miles.utils.debug_utils.dump_schedule import is_dump_rollout
 from miles.utils.types import Sample
 
 logger = logging.getLogger(__name__)
@@ -119,6 +120,8 @@ def save_debug_rollout_data(
 ) -> None:
     # TODO to be refactored (originally Buffer._set_data)
     if (path_template := args.save_debug_rollout_data) is not None:
+        if not evaluation and not is_dump_rollout(rollout_id, interval=args.dump_details_interval):
+            return
         stem = _compute_dump_stem(rollout_id, evaluation=evaluation, trainer_model_id=trainer_model_id)
         path = _format_dump_path(path_template, stem=stem)
         logger.info(f"Save debug rollout data to {path}")

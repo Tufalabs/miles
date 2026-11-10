@@ -38,6 +38,7 @@ def test_only_one_rank_per_shard_writes(tmp_path, monkeypatch, tp_rank, is_pp_la
     args = SimpleNamespace(
         save_debug_train_data=str(tmp_path / "{rollout_id}_{rank}.pt"),
         qkv_format="thd",
+        dump_details_interval=1,
     )
 
     train_dump.save_debug_train_data(args, rollout_id=3, rollout_data={"sample_indices": [0]})

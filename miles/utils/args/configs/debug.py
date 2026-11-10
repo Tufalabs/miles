@@ -69,6 +69,16 @@ class DebugConfig(BaseConfig):
         str | None,
         Arg(help="Dump all details of training for post-hoc analysis and visualization."),
     ] = None
+    dump_details_interval: A[
+        int,
+        Arg(
+            help=(
+                "Write the debug dumps (rollout_data, trajectory, dashboard_columns, train_data, policy_loss_debug) "
+                "only for training rollouts whose global rollout id is a multiple of this. Evaluation dumps are "
+                "always written."
+            )
+        ),
+    ] = 1
     dumper_enable: A[
         bool,
         Arg(

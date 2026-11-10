@@ -1190,6 +1190,9 @@ def miles_validate_args(args):
         args.save_debug_rollout_data = f"{args.dump_details}/rollout_data/{{rollout_id}}.pt"
         args.save_debug_train_data = f"{args.dump_details}/train_data/{{rollout_id}}_{{rank}}.pt"
         args.save_debug_trajectory_data = f"{args.dump_details}/trajectory/{{rollout_id}}.jsonl"
+    assert (
+        args.dump_details_interval >= 1
+    ), f"--dump-details-interval must be at least 1, got {args.dump_details_interval}"
 
     if args.load_debug_rollout_data is not None:
         logger.info(

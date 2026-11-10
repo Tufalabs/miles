@@ -1,13 +1,30 @@
 from argparse import Namespace
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
 
 from miles.backends.training_utils.parallel import get_parallel_state
+from miles.utils.debug_utils.dump_schedule import is_dump_rollout
 from miles.utils.types import RolloutBatch
 
 _POLICY_LOSS_DUMP_COUNTER = 0
+# The global rollout id whose training is running, for the loss calls that cannot see it; None outside
+# training_rollout_scope (every call is then dumped, without an id).
+_training_rollout_id: int | None = None
+
+
+@contextmanager
+def training_rollout_scope(rollout_id: int) -> Iterator[None]:
+    """Mark the loss calls made inside this block as part of this rollout's training."""
+    global _training_rollout_id
+    _training_rollout_id = rollout_id
+    try:
+        yield
+    finally:
+        _training_rollout_id = None
 
 
 def maybe_dump_policy_loss_debug(
@@ -23,7 +40,10 @@ def maybe_dump_policy_loss_debug(
     pg_loss: torch.Tensor,
 ) -> None:
     dump_dir = args.dump_details
-    if dump_dir is None:
+    rollout_id = _training_rollout_id
+    if dump_dir is None or (
+        rollout_id is not None and not is_dump_rollout(rollout_id, interval=args.dump_details_interval)
+    ):
         return
     # TP peers compute the loss on identical data; CP ranks hold distinct token slices
     if get_parallel_state().tp.rank != 0:
@@ -60,6 +80,7 @@ def maybe_dump_policy_loss_debug(
     torch.save(
         {
             "rank": rank,
+            "rollout_id": rollout_id,
             "call": counter,
             "samples": samples,
             "ppo_kl": to_cpu(ppo_kl),
