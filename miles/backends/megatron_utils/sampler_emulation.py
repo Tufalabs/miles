@@ -10,6 +10,7 @@ Enabled by the environment variable MILES_SAMPLER_EMULATION, a comma-separated l
              rounded to E2M1; a block whose scale rounds to zero is zeroed, as in FlashInfer's kernel. In plain
              PyTorch, with the scale rounded to nearest E4M3
   k_nvfp4, v_nvfp4  only K, only V
+  k_nvfp4_rotated   K through NVFP4 in a Hadamard-rotated basis of head_dim (what a rotating sampler would store)
   kv_nvfp4_kernel   the same through miles' Triton kernel (its rounding of the scale is not verified)
   q_fp8      the query cast to FP8 E4M3 and back
   out_fp8    the attention output cast to FP8 E4M3 and back
@@ -32,7 +33,7 @@ ENV_VAR = "MILES_SAMPLER_EMULATION"
 STATS_ENV_VAR = "MILES_SAMPLER_EMULATION_STATS"
 _E4M3_MIN_NORMAL = 2.0**-6
 _E4M3_MIN_SUBNORMAL = 2.0**-9
-PARTS = ("kv_nvfp4", "k_nvfp4", "v_nvfp4", "kv_nvfp4_kernel", "q_fp8", "out_fp8")
+PARTS = ("kv_nvfp4", "k_nvfp4", "k_nvfp4_rotated", "v_nvfp4", "kv_nvfp4_kernel", "q_fp8", "out_fp8")
 # FlashInfer rounds amax / 6 to E4M3 with no floor: below half of the smallest subnormal (2**-9) it is zero.
 _ZERO_BLOCK_AMAX = 6.0 * 2.0**-10
 
@@ -78,6 +79,26 @@ class _Nvfp4StraightThrough(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad):
         return grad
+
+
+def _hadamard(n: int, device, dtype) -> torch.Tensor:
+    """The orthonormal Sylvester Hadamard matrix of size n (a power of two)."""
+    h = torch.ones(1, 1, device=device, dtype=torch.float32)
+    while h.shape[0] < n:
+        h = torch.cat([torch.cat([h, h], dim=1), torch.cat([h, -h], dim=1)], dim=0)
+    assert h.shape[0] == n
+    return (h / n**0.5).to(dtype)
+
+
+def _nvfp4_rotated(x: torch.Tensor) -> torch.Tensor:
+    """NVFP4 in a rotated basis of head_dim: rotate by a Hadamard matrix with fixed random signs, quantize,
+    rotate back. What a sampler would store if it rotated K (and the query) before the cache."""
+    n = x.shape[-1]
+    generator = torch.Generator(device="cpu").manual_seed(0)
+    signs = (torch.randint(0, 2, (n,), generator=generator) * 2 - 1).to(device=x.device, dtype=torch.float32)
+    rotation = signs[:, None] * _hadamard(n, x.device, torch.float32)
+    rotated = (x.float() @ rotation).to(x.dtype)
+    return (_Nvfp4StraightThrough.apply(rotated).float() @ rotation.T).to(x.dtype)
 
 
 def _nvfp4_kv(x: torch.Tensor, kernel: bool) -> torch.Tensor:
@@ -127,7 +148,9 @@ def _wrap_core_attention(
             logger.info("sampler emulation stats %s V: %s", name, _block_scale_stats(value))
             logger.info("sampler emulation stats %s Q: %s", name, _element_stats(query))
         kernel = "kv_nvfp4_kernel" in parts
-        if kernel or "kv_nvfp4" in parts or "k_nvfp4" in parts:
+        if "k_nvfp4_rotated" in parts:
+            key = _nvfp4_rotated(key)
+        elif kernel or "kv_nvfp4" in parts or "k_nvfp4" in parts:
             key = _nvfp4_kv(key, kernel)
         if kernel or "kv_nvfp4" in parts or "v_nvfp4" in parts:
             value = _nvfp4_kv(value * v_scale, kernel) * (1.0 / v_scale)
