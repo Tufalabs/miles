@@ -9,6 +9,7 @@ Enabled by the environment variable MILES_SAMPLER_EMULATION, a comma-separated l
   kv_nvfp4   K and V through NVFP4: blocks of 16 along head_dim, an E4M3 scale of amax / 6 per block, values
              rounded to E2M1; a block whose scale rounds to zero is zeroed, as in FlashInfer's kernel. In plain
              PyTorch, with the scale rounded to nearest E4M3
+  k_nvfp4, v_nvfp4  only K, only V
   kv_nvfp4_kernel   the same through miles' Triton kernel (its rounding of the scale is not verified)
   q_fp8      the query cast to FP8 E4M3 and back
   out_fp8    the attention output cast to FP8 E4M3 and back
@@ -31,7 +32,7 @@ ENV_VAR = "MILES_SAMPLER_EMULATION"
 STATS_ENV_VAR = "MILES_SAMPLER_EMULATION_STATS"
 _E4M3_MIN_NORMAL = 2.0**-6
 _E4M3_MIN_SUBNORMAL = 2.0**-9
-PARTS = ("kv_nvfp4", "kv_nvfp4_kernel", "q_fp8", "out_fp8")
+PARTS = ("kv_nvfp4", "k_nvfp4", "v_nvfp4", "kv_nvfp4_kernel", "q_fp8", "out_fp8")
 # FlashInfer rounds amax / 6 to E4M3 with no floor: below half of the smallest subnormal (2**-9) it is zero.
 _ZERO_BLOCK_AMAX = 6.0 * 2.0**-10
 
@@ -125,9 +126,11 @@ def _wrap_core_attention(
             logger.info("sampler emulation stats %s K: %s", name, _block_scale_stats(key))
             logger.info("sampler emulation stats %s V: %s", name, _block_scale_stats(value))
             logger.info("sampler emulation stats %s Q: %s", name, _element_stats(query))
-        if "kv_nvfp4" in parts or "kv_nvfp4_kernel" in parts:
-            kernel = "kv_nvfp4_kernel" in parts
-            key, value = _nvfp4_kv(key, kernel), _nvfp4_kv(value * v_scale, kernel) * (1.0 / v_scale)
+        kernel = "kv_nvfp4_kernel" in parts
+        if kernel or "kv_nvfp4" in parts or "k_nvfp4" in parts:
+            key = _nvfp4_kv(key, kernel)
+        if kernel or "kv_nvfp4" in parts or "v_nvfp4" in parts:
+            value = _nvfp4_kv(value * v_scale, kernel) * (1.0 / v_scale)
         if "q_fp8" in parts:
             query = _fp8_straight_through(query)
         output = original_forward(query, key, value, *args, **kwargs)
