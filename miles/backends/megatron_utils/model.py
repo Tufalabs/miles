@@ -83,6 +83,7 @@ def _has_loadable_ckpt(load_dir: str | None) -> bool:
 
 
 from .fp32_param_utils import enforce_marked_param_dtypes
+from .sampler_emulation import maybe_install_sampler_emulation
 from .lora.bridge import _ensure_model_list, _setup_lora_model_via_bridge  # noqa: F401
 
 
@@ -183,6 +184,8 @@ def setup_model_and_optimizer(
             model = get_model(provider_func, ModelType.encoder_or_decoder)
     for model_chunk in model:
         model_chunk.lora_attached = lora_attached
+    if role == "actor":
+        maybe_install_sampler_emulation(model)
 
     if args.debug_disable_optimizer:
         if is_first_replica_megatron_main_rank():
