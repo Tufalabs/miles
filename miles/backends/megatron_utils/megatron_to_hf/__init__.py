@@ -16,6 +16,7 @@ from .qwen3_5 import convert_qwen3_5_to_hf
 from .qwen3_8_next import convert_qwen3_8_next_to_hf
 from .qwen3_next import convert_qwen3_next_to_hf
 from .qwen3moe import convert_qwen3moe_to_hf
+from .v_scale_folding import fold_v_scale
 
 
 # TODO unify w/ `convert_to_hf`
@@ -29,7 +30,7 @@ def postprocess_hf_param(args, megatron_param_name, hf_param_name, param):
 def convert_to_hf(args, model_name, name, param, quantization_config=None, packed_weight_basenames=None):
     param = remove_padding(name, param, args.backend.vocab_size)
 
-    converted_named_tensors = _convert_to_hf_core(args, model_name, name, param)
+    converted_named_tensors = fold_v_scale(_convert_to_hf_core(args, model_name, name, param))
 
     return quantize_params(args, name, converted_named_tensors, quantization_config, packed_weight_basenames)
 
