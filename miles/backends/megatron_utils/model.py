@@ -83,6 +83,7 @@ def _has_loadable_ckpt(load_dir: str | None) -> bool:
 
 
 from .fp32_param_utils import enforce_marked_param_dtypes
+from .freeze_params import maybe_zero_frozen_grads
 from .grad_sketch import maybe_save_grad_sketch
 from .sampler_emulation import maybe_install_sampler_emulation
 from .lora.bridge import _ensure_model_list, _setup_lora_model_via_bridge  # noqa: F401
@@ -611,6 +612,7 @@ def train_one_step(
         losses_reduced = run_forward_backward_pass(
             args, dumper_phase_util, data_iterator, model, num_microbatches, num_rollouts
         )
+    maybe_zero_frozen_grads(model)
     maybe_save_grad_sketch(model, args.dump_details, rollout_id, step_id)
     if args.enable_sample_ownership_checker:
         local_consumed_identities = SampleIdentityExtractor.get_consumed_sample_identities(
