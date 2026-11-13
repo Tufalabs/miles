@@ -10,6 +10,8 @@ Enabled by the environment variable MILES_SAMPLER_EMULATION, a comma-separated l
              rounded to E2M1; a block whose scale rounds to zero is zeroed, as in FlashInfer's kernel
   q_fp8      the query cast to FP8 E4M3 and back
   out_fp8    the attention output cast to FP8 E4M3 and back
+MILES_SAMPLER_EMULATION_STATS=1 logs, once per layer, where K, V, the query and the attention output sit
+against the formats' ranges (it can be set without any part, to measure only).
 CUDA only (Triton kernel).
 """
 
@@ -23,6 +25,9 @@ from miles.kernels.quant.fake_quant import COMPRESSED_KV_BLOCK_SIZE, fake_quant_
 logger = logging.getLogger(__name__)
 
 ENV_VAR = "MILES_SAMPLER_EMULATION"
+STATS_ENV_VAR = "MILES_SAMPLER_EMULATION_STATS"
+_E4M3_MIN_NORMAL = 2.0**-6
+_E4M3_MIN_SUBNORMAL = 2.0**-9
 PARTS = ("kv_nvfp4", "q_fp8", "out_fp8")
 # FlashInfer rounds amax / 6 to E4M3 with no floor: below half of the smallest subnormal (2**-9) it is zero.
 _ZERO_BLOCK_AMAX = 6.0 * 2.0**-10
@@ -51,15 +56,47 @@ def _nvfp4_kv(x: torch.Tensor) -> torch.Tensor:
     return quantized * keep.to(quantized.dtype)
 
 
-def _wrap_core_attention(core_attention: torch.nn.Module, parts: frozenset[str]) -> None:
+def _block_scale_stats(x: torch.Tensor) -> str:
+    """Where the NVFP4 block scales (amax / 6) of a K or V tensor fall in E4M3."""
+    blocks = x.detach().float().reshape(-1, COMPRESSED_KV_BLOCK_SIZE)
+    scale = blocks.abs().amax(dim=-1) / 6.0
+    quantiles = torch.quantile(scale[:: max(1, scale.numel() // 200_000)], torch.tensor([0.01, 0.1, 0.5, 0.9], device=scale.device))
+    return (
+        f"scale q01={quantiles[0]:.2e} q10={quantiles[1]:.2e} q50={quantiles[2]:.2e} q90={quantiles[3]:.2e}"
+        f" zeroed={(scale < _E4M3_MIN_SUBNORMAL / 2).float().mean():.4f}"
+        f" subnormal={(scale < _E4M3_MIN_NORMAL).float().mean():.4f}"
+    )
+
+
+def _element_stats(x: torch.Tensor) -> str:
+    """Where the elements of a tensor that is cast to FP8 E4M3 at scale 1 fall."""
+    mag = x.detach().float().abs().flatten()
+    quantiles = torch.quantile(mag[:: max(1, mag.numel() // 200_000)], torch.tensor([0.1, 0.5, 0.9], device=mag.device))
+    return (
+        f"abs q10={quantiles[0]:.2e} q50={quantiles[1]:.2e} q90={quantiles[2]:.2e} max={mag.max():.2e}"
+        f" to_zero={(mag < _E4M3_MIN_SUBNORMAL / 2).float().mean():.4f}"
+        f" subnormal={(mag < _E4M3_MIN_NORMAL).float().mean():.4f} above_448={(mag > 448).float().mean():.6f}"
+    )
+
+
+def _wrap_core_attention(core_attention: torch.nn.Module, parts: frozenset[str], stats_name: str | None) -> None:
     original_forward = core_attention.forward
+    pending_stats = [stats_name] if stats_name is not None else []
+    pending_output_stats = list(pending_stats)
 
     def forward(query, key, value, *args, **kwargs):
+        if pending_stats:
+            name = pending_stats.pop()
+            logger.info("sampler emulation stats %s K: %s", name, _block_scale_stats(key))
+            logger.info("sampler emulation stats %s V: %s", name, _block_scale_stats(value))
+            logger.info("sampler emulation stats %s Q: %s", name, _element_stats(query))
         if "kv_nvfp4" in parts:
             key, value = _nvfp4_kv(key), _nvfp4_kv(value)
         if "q_fp8" in parts:
             query = _fp8_straight_through(query)
         output = original_forward(query, key, value, *args, **kwargs)
+        if pending_output_stats:
+            logger.info("sampler emulation stats %s OUT: %s", pending_output_stats.pop(), _element_stats(output))
         if "out_fp8" in parts:
             output = _fp8_straight_through(output)
         return output
@@ -70,16 +107,17 @@ def _wrap_core_attention(core_attention: torch.nn.Module, parts: frozenset[str])
 def maybe_install_sampler_emulation(model_chunks) -> None:
     """Wrap every layer's core attention when MILES_SAMPLER_EMULATION is set."""
     spec = os.environ.get(ENV_VAR, "").strip()
-    if not spec:
+    stats = os.environ.get(STATS_ENV_VAR, "") == "1"
+    if not spec and not stats:
         return
-    parts = frozenset(part.strip() for part in spec.split(","))
+    parts = frozenset(part.strip() for part in spec.split(",") if part.strip())
     unknown = parts - set(PARTS)
     assert not unknown, f"{ENV_VAR}: unknown parts {sorted(unknown)}, expected a subset of {PARTS}"
     wrapped = 0
     for chunk in model_chunks:
         for name, module in chunk.named_modules():
             if name.endswith("self_attention") and hasattr(module, "core_attention"):
-                _wrap_core_attention(module.core_attention, parts)
+                _wrap_core_attention(module.core_attention, parts, name if stats else None)
                 wrapped += 1
     assert wrapped > 0, f"{ENV_VAR} is set but no self_attention.core_attention module was found"
     logger.info("sampler emulation installed: parts=%s layers=%d", sorted(parts), wrapped)
