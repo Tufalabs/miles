@@ -11,6 +11,8 @@ Enabled by the environment variable MILES_SAMPLER_EMULATION, a comma-separated l
              PyTorch, with the scale rounded to nearest E4M3
   k_nvfp4, v_nvfp4  only K, only V
   k_nvfp4_rotated   K through NVFP4 in a Hadamard-rotated basis of head_dim (what a rotating sampler would store)
+  k_nvfp4_equalized K through NVFP4 after dividing each coordinate by its RMS (measured on the first batch, per
+                    layer, shared within a RoPE pair), multiplied back after
   kv_nvfp4_kernel   the same through miles' Triton kernel (its rounding of the scale is not verified)
   q_fp8      the query cast to FP8 E4M3 and back
   out_fp8    the attention output cast to FP8 E4M3 and back
@@ -33,7 +35,16 @@ ENV_VAR = "MILES_SAMPLER_EMULATION"
 STATS_ENV_VAR = "MILES_SAMPLER_EMULATION_STATS"
 _E4M3_MIN_NORMAL = 2.0**-6
 _E4M3_MIN_SUBNORMAL = 2.0**-9
-PARTS = ("kv_nvfp4", "k_nvfp4", "k_nvfp4_rotated", "v_nvfp4", "kv_nvfp4_kernel", "q_fp8", "out_fp8")
+PARTS = (
+    "kv_nvfp4",
+    "k_nvfp4",
+    "k_nvfp4_rotated",
+    "k_nvfp4_equalized",
+    "v_nvfp4",
+    "kv_nvfp4_kernel",
+    "q_fp8",
+    "out_fp8",
+)
 # FlashInfer rounds amax / 6 to E4M3 with no floor: below half of the smallest subnormal (2**-9) it is zero.
 _ZERO_BLOCK_AMAX = 6.0 * 2.0**-10
 
@@ -101,6 +112,22 @@ def _nvfp4_rotated(x: torch.Tensor) -> torch.Tensor:
     return (_Nvfp4StraightThrough.apply(rotated).float() @ rotation.T).to(x.dtype)
 
 
+def _pair_rms(x: torch.Tensor) -> torch.Tensor:
+    """The RMS of each head_dim coordinate over tokens and heads, shared by the two coordinates of a RoPE pair
+    (i and i + n/2), so that a per-coordinate scale built from it commutes with RoPE."""
+    n = x.shape[-1]
+    mean_square = x.detach().float().reshape(-1, n).pow(2).mean(dim=0)
+    pair = 0.5 * (mean_square[: n // 2] + mean_square[n // 2 :])
+    return torch.cat([pair, pair]).sqrt().clamp_min(1e-6)
+
+
+def _nvfp4_equalized(x: torch.Tensor, rms: torch.Tensor) -> torch.Tensor:
+    """NVFP4 on K divided by its per-coordinate RMS, multiplied back. What the sampler would store if the RMS
+    were folded into k_norm's gain (and its inverse into q_norm's), which leaves q.k unchanged."""
+    scaled = (x.float() / rms).to(x.dtype)
+    return (_Nvfp4StraightThrough.apply(scaled).float() * rms).to(x.dtype)
+
+
 def _nvfp4_kv(x: torch.Tensor, kernel: bool) -> torch.Tensor:
     if not kernel:
         return _Nvfp4StraightThrough.apply(x)
@@ -140,6 +167,7 @@ def _wrap_core_attention(
     original_forward = core_attention.forward
     pending_stats = [stats_name] if stats_name is not None else []
     pending_output_stats = list(pending_stats)
+    k_rms: list[torch.Tensor] = []
 
     def forward(query, key, value, *args, **kwargs):
         if pending_stats:
@@ -148,7 +176,14 @@ def _wrap_core_attention(
             logger.info("sampler emulation stats %s V: %s", name, _block_scale_stats(value))
             logger.info("sampler emulation stats %s Q: %s", name, _element_stats(query))
         kernel = "kv_nvfp4_kernel" in parts
-        if "k_nvfp4_rotated" in parts:
+        if "k_nvfp4_equalized" in parts:
+            if not k_rms:
+                k_rms.append(_pair_rms(key))
+                ratio = k_rms[0].max() / k_rms[0].min()
+                logger.info("sampler emulation K rms per coordinate: min=%.3e median=%.3e max=%.3e max/min=%.1f",
+                            k_rms[0].min(), k_rms[0].median(), k_rms[0].max(), ratio)
+            key = _nvfp4_equalized(key, k_rms[0])
+        elif "k_nvfp4_rotated" in parts:
             key = _nvfp4_rotated(key)
         elif kernel or "kv_nvfp4" in parts or "k_nvfp4" in parts:
             key = _nvfp4_kv(key, kernel)
