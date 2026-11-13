@@ -7,7 +7,9 @@ straight-through gradients, so that the trainer's distribution matches the sampl
 
 Enabled by the environment variable MILES_SAMPLER_EMULATION, a comma-separated list of:
   kv_nvfp4   K and V through NVFP4: blocks of 16 along head_dim, an E4M3 scale of amax / 6 per block, values
-             rounded to E2M1; a block whose scale rounds to zero is zeroed, as in FlashInfer's kernel
+             rounded to E2M1; a block whose scale rounds to zero is zeroed, as in FlashInfer's kernel. In plain
+             PyTorch, with the scale rounded to nearest E4M3
+  kv_nvfp4_kernel   the same through miles' Triton kernel (its rounding of the scale is not verified)
   q_fp8      the query cast to FP8 E4M3 and back
   out_fp8    the attention output cast to FP8 E4M3 and back
 MILES_SAMPLER_EMULATION_STATS=1 logs, once per layer, where K, V, the query and the attention output sit
@@ -29,7 +31,7 @@ ENV_VAR = "MILES_SAMPLER_EMULATION"
 STATS_ENV_VAR = "MILES_SAMPLER_EMULATION_STATS"
 _E4M3_MIN_NORMAL = 2.0**-6
 _E4M3_MIN_SUBNORMAL = 2.0**-9
-PARTS = ("kv_nvfp4", "q_fp8", "out_fp8")
+PARTS = ("kv_nvfp4", "kv_nvfp4_kernel", "q_fp8", "out_fp8")
 # FlashInfer rounds amax / 6 to E4M3 with no floor: below half of the smallest subnormal (2**-9) it is zero.
 _ZERO_BLOCK_AMAX = 6.0 * 2.0**-10
 
@@ -50,7 +52,36 @@ def _fp8_straight_through(x: torch.Tensor) -> torch.Tensor:
     return _Fp8StraightThrough.apply(x)
 
 
-def _nvfp4_kv(x: torch.Tensor) -> torch.Tensor:
+def _nvfp4_round_trip(x: torch.Tensor) -> torch.Tensor:
+    """FlashInfer's `nvfp4_kv_quantize` at a global scale of 1, and the read back, in plain PyTorch.
+
+    Per block of 16 along the last dimension: the scale is amax / 6 rounded to nearest E4M3 (zero when it
+    rounds to zero, and then the block reads back as zeros); the values over that rounded scale are rounded to
+    nearest-even E2M1 (0, 0.5, 1, 1.5, 2, 3, 4, 6), saturating at 6.
+    """
+    blocks = x.float().reshape(-1, COMPRESSED_KV_BLOCK_SIZE)
+    scale = (blocks.abs().amax(dim=-1, keepdim=True) / 6.0).to(torch.float8_e4m3fn).float()
+    nonzero = scale > 0
+    scaled = (blocks / torch.where(nonzero, scale, torch.ones_like(scale))).clamp(-6.0, 6.0)
+    magnitude = scaled.abs()
+    step = torch.where(magnitude < 2.0, 0.5, torch.where(magnitude < 4.0, 1.0, 2.0))
+    rounded = torch.round(magnitude / step) * step * torch.sign(scaled)
+    return torch.where(nonzero, rounded * scale, torch.zeros_like(rounded)).reshape(x.shape).to(x.dtype)
+
+
+class _Nvfp4StraightThrough(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        return _nvfp4_round_trip(x)
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad
+
+
+def _nvfp4_kv(x: torch.Tensor, kernel: bool) -> torch.Tensor:
+    if not kernel:
+        return _Nvfp4StraightThrough.apply(x)
     quantized = fake_quant_compressed_kv(x)
     blocks = x.detach().reshape(*x.shape[:-1], -1, COMPRESSED_KV_BLOCK_SIZE)
     keep = (blocks.abs().amax(dim=-1, keepdim=True) > _ZERO_BLOCK_AMAX).expand_as(blocks).reshape(x.shape)
@@ -94,8 +125,9 @@ def _wrap_core_attention(
             logger.info("sampler emulation stats %s K: %s", name, _block_scale_stats(key))
             logger.info("sampler emulation stats %s V: %s", name, _block_scale_stats(value))
             logger.info("sampler emulation stats %s Q: %s", name, _element_stats(query))
-        if "kv_nvfp4" in parts:
-            key, value = _nvfp4_kv(key), _nvfp4_kv(value * v_scale) * (1.0 / v_scale)
+        if "kv_nvfp4" in parts or "kv_nvfp4_kernel" in parts:
+            kernel = "kv_nvfp4_kernel" in parts
+            key, value = _nvfp4_kv(key, kernel), _nvfp4_kv(value * v_scale, kernel) * (1.0 / v_scale)
         if "q_fp8" in parts:
             query = _fp8_straight_through(query)
         output = original_forward(query, key, value, *args, **kwargs)
