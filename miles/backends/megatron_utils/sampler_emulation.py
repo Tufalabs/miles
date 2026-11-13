@@ -20,6 +20,7 @@ import os
 
 import torch
 
+from miles.backends.megatron_utils.megatron_to_hf.v_scale_folding import _LOG2_SCALES as _V_LOG2_SCALES
 from miles.kernels.quant.fake_quant import COMPRESSED_KV_BLOCK_SIZE, fake_quant_compressed_kv
 
 logger = logging.getLogger(__name__)
@@ -79,7 +80,10 @@ def _element_stats(x: torch.Tensor) -> str:
     )
 
 
-def _wrap_core_attention(core_attention: torch.nn.Module, parts: frozenset[str], stats_name: str | None) -> None:
+def _wrap_core_attention(
+    core_attention: torch.nn.Module, parts: frozenset[str], stats_name: str | None, v_scale: float
+) -> None:
+    """`v_scale`: the factor the sampler's V carries (MILES_SAMPLER_V_SCALE_LOG2); V is quantized at that scale."""
     original_forward = core_attention.forward
     pending_stats = [stats_name] if stats_name is not None else []
     pending_output_stats = list(pending_stats)
@@ -91,7 +95,7 @@ def _wrap_core_attention(core_attention: torch.nn.Module, parts: frozenset[str],
             logger.info("sampler emulation stats %s V: %s", name, _block_scale_stats(value))
             logger.info("sampler emulation stats %s Q: %s", name, _element_stats(query))
         if "kv_nvfp4" in parts:
-            key, value = _nvfp4_kv(key), _nvfp4_kv(value)
+            key, value = _nvfp4_kv(key), _nvfp4_kv(value * v_scale) * (1.0 / v_scale)
         if "q_fp8" in parts:
             query = _fp8_straight_through(query)
         output = original_forward(query, key, value, *args, **kwargs)
@@ -117,7 +121,9 @@ def maybe_install_sampler_emulation(model_chunks) -> None:
     for chunk in model_chunks:
         for name, module in chunk.named_modules():
             if name.endswith("self_attention") and hasattr(module, "core_attention"):
-                _wrap_core_attention(module.core_attention, parts, name if stats else None)
+                layer = int(name.split(".layers.")[1].split(".")[0])
+                v_scale = 2.0 ** _V_LOG2_SCALES[layer] if _V_LOG2_SCALES is not None else 1.0
+                _wrap_core_attention(module.core_attention, parts, name if stats else None, v_scale)
                 wrapped += 1
     assert wrapped > 0, f"{ENV_VAR} is set but no self_attention.core_attention module was found"
     logger.info("sampler emulation installed: parts=%s layers=%d", sorted(parts), wrapped)
