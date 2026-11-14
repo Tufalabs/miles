@@ -18,6 +18,7 @@ Enabled by the environment variable MILES_SAMPLER_EMULATION, a comma-separated l
   out_fp8    the attention output cast to FP8 E4M3 and back
 MILES_SAMPLER_EMULATION_STATS=1 logs, once per layer, where K, V, the query and the attention output sit
 against the formats' ranges (it can be set without any part, to measure only).
+MILES_SAMPLER_EMULATION_LAYERS=<first>-<last> restricts the parts to those layers (inclusive); default all.
 MILES_SAMPLER_EMULATION_SCORE_STATS=1 logs, once per layer, what K's NVFP4 rounding does to the attention
 scores and patterns of the first sequences of the first batch (it can be set without any part).
 CUDA only (Triton kernel).
@@ -36,6 +37,7 @@ logger = logging.getLogger(__name__)
 ENV_VAR = "MILES_SAMPLER_EMULATION"
 STATS_ENV_VAR = "MILES_SAMPLER_EMULATION_STATS"
 SCORE_STATS_ENV_VAR = "MILES_SAMPLER_EMULATION_SCORE_STATS"
+LAYERS_ENV_VAR = "MILES_SAMPLER_EMULATION_LAYERS"
 _SCORE_STATS_SEQUENCES = 8
 _E4M3_MIN_NORMAL = 2.0**-6
 _E4M3_MIN_SUBNORMAL = 2.0**-9
@@ -267,13 +269,16 @@ def maybe_install_sampler_emulation(model_chunks) -> None:
     parts = frozenset(part.strip() for part in spec.split(",") if part.strip())
     unknown = parts - set(PARTS)
     assert not unknown, f"{ENV_VAR}: unknown parts {sorted(unknown)}, expected a subset of {PARTS}"
-    wrapped = 0
+    first, last = (int(bound) for bound in os.environ.get(LAYERS_ENV_VAR, "0-100000").split("-"))
+    wrapped, emulating = 0, 0
     for chunk in model_chunks:
         for name, module in chunk.named_modules():
             if name.endswith("self_attention") and hasattr(module, "core_attention"):
                 layer = int(name.split(".layers.")[1].split(".")[0])
                 v_scale = 2.0 ** _V_LOG2_SCALES[layer] if _V_LOG2_SCALES is not None else 1.0
-                _wrap_core_attention(module.core_attention, parts, name if stats else None, v_scale, name if score_stats else None)
+                layer_parts = parts if first <= layer <= last else frozenset()
+                _wrap_core_attention(module.core_attention, layer_parts, name if stats else None, v_scale, name if score_stats else None)
                 wrapped += 1
+                emulating += bool(layer_parts)
     assert wrapped > 0, f"{ENV_VAR} is set but no self_attention.core_attention module was found"
-    logger.info("sampler emulation installed: parts=%s layers=%d", sorted(parts), wrapped)
+    logger.info("sampler emulation installed: parts=%s in %d of %d layers (layers %d to %d)", sorted(parts), emulating, wrapped, first, last)
