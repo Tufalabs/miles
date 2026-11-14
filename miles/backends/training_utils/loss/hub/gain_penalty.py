@@ -15,6 +15,11 @@ Both forwards carry gradient, in two passes over each micro-batch that accumulat
 Outside the rounded pass the emulation is off, so scoring and the policy term see the plain model. The huber
 threshold is MILES_GAIN_PENALTY_DELTA (default 1 nat). Metrics, from the plain pass: `gain_d2` (mean squared
 difference), `gain_abs_d` (mean absolute difference), `gain_penalty` (the term before the coefficient's sum).
+
+MILES_GAIN_PROJECTION=1 (in place of the coefficient) does not add the penalty to the loss. Each training step
+first computes the penalty's own gradient (the penalty phase: both passes with the policy term dropped), then
+the policy gradient as usual, and removes from the policy gradient its component along the penalty's gradient
+when that component would raise the penalty (megatron_utils/gain_projection.py).
 """
 
 import contextlib
@@ -26,12 +31,48 @@ ENV_VAR = "MILES_GAIN_PENALTY"
 DELTA_ENV_VAR = "MILES_GAIN_PENALTY_DELTA"
 _COEFFICIENT = float(os.environ.get(ENV_VAR, "0"))
 _DELTA = float(os.environ.get(DELTA_ENV_VAR, "1"))
+PROJECTION_ENV_VAR = "MILES_GAIN_PROJECTION"
+_PROJECTION = os.environ.get(PROJECTION_ENV_VAR, "") == "1"
+assert not (_PROJECTION and _COEFFICIENT > 0), f"set {ENV_VAR} or {PROJECTION_ENV_VAR}, not both"
 _ROUNDED_LOG_PROBS_KEY = "gain_penalty_rounded_log_probs"
 _rounding_active = False
+_penalty_phase = False
+_phase_sums = [0.0, 0.0]  # of the current penalty phase: sum of squared differences, supervised tokens
+
+
+def configured() -> bool:
+    """The penalty or the projection is on for this run: the sampler emulation then applies only in rounded passes."""
+    return _COEFFICIENT > 0 or _PROJECTION
+
+
+def projection_enabled() -> bool:
+    return _PROJECTION
+
+
+def in_penalty_phase() -> bool:
+    return _penalty_phase
 
 
 def enabled() -> bool:
-    return _COEFFICIENT > 0
+    """The penalty is part of the loss of the pass that runs now."""
+    return _penalty_phase if _PROJECTION else _COEFFICIENT > 0
+
+
+@contextlib.contextmanager
+def penalty_phase():
+    """The projection's first phase: forward/backward passes whose loss is the penalty alone."""
+    global _penalty_phase
+    _penalty_phase = True
+    _phase_sums[0] = _phase_sums[1] = 0.0
+    try:
+        yield
+    finally:
+        _penalty_phase = False
+
+
+def phase_sums() -> tuple[float, float]:
+    """Sum of squared log-prob differences and supervised tokens of the last penalty phase, on this rank."""
+    return _phase_sums[0], _phase_sums[1]
 
 
 def rounding_active() -> bool:
@@ -66,11 +107,12 @@ def apply(
     `log_probs`: this forward's log-probs of the sampled tokens (with gradient). `plain_log_probs`: the plain
     trainer's from the no-grad scoring pass.
     """
+    coefficient = 1.0 if _PROJECTION else _COEFFICIENT
     if rounding_active():
         batch[_ROUNDED_LOG_PROBS_KEY] = log_probs.detach()
         d = plain_log_probs.detach() - log_probs
         d = torch.where(active_tokens, torch.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0), d.new_zeros(()))
-        return _COEFFICIENT * _huber(d), {}
+        return coefficient * _huber(d), {}
     rounded = batch.get(_ROUNDED_LOG_PROBS_KEY)
     assert rounded is not None, "gain penalty: the rounded pass did not run before the plain pass"
     d = log_probs - rounded
@@ -78,4 +120,8 @@ def apply(
     penalty = _huber(d)
     detached = d.detach()
     metrics = {"gain_d2": detached * detached, "gain_abs_d": detached.abs(), "gain_penalty": penalty.detach()}
-    return pg_loss + _COEFFICIENT * penalty, metrics
+    if _PROJECTION:  # the penalty phase: the policy term is dropped
+        _phase_sums[0] += (detached * detached).sum().item()
+        _phase_sums[1] += active_tokens.sum().item()
+        return 0.0 * pg_loss + penalty, metrics
+    return pg_loss + coefficient * penalty, metrics

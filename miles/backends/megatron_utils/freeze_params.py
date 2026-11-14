@@ -8,6 +8,9 @@ MILES_FREEZE_PARAMS is a comma-separated list of entries:
 
 With plain SGD (no momentum, no weight decay) that keeps the frozen values at their start. The logged gradient
 norm is then the norm over what is left free.
+
+MILES_GRAD_SCALE is a comma-separated list of `<substring>=<factor>`: the gradient of a parameter whose name
+contains the substring is multiplied by the factor (with plain SGD, a learning rate of its own for that group).
 """
 
 import logging
@@ -22,7 +25,10 @@ _ROWS_PREFIX = "qkv_rows:"
 _ENTRIES = tuple(p for p in os.environ.get(ENV_VAR, "").split(",") if p)
 _PATTERNS = tuple(p for p in _ENTRIES if not p.startswith(_ROWS_PREFIX))
 _QKV_PARTS = "".join(p[len(_ROWS_PREFIX) :] for p in _ENTRIES if p.startswith(_ROWS_PREFIX))
+SCALE_ENV_VAR = "MILES_GRAD_SCALE"
+_SCALES = tuple((entry.rsplit("=", 1)[0], float(entry.rsplit("=", 1)[1])) for entry in os.environ.get(SCALE_ENV_VAR, "").split(",") if entry)
 _logged = False
+_scale_logged = False
 
 
 def _grad_of(param: torch.Tensor) -> torch.Tensor | None:
@@ -48,9 +54,31 @@ def zero_qkv_rows(attention: torch.nn.Module, grad: torch.Tensor, parts: str) ->
 
 
 @torch.no_grad()
+def _scale_grads(model_chunks) -> None:
+    global _scale_logged
+    scaled = 0
+    for chunk in model_chunks:
+        for name, param in chunk.named_parameters():
+            grad = _grad_of(param)
+            if grad is None:
+                continue
+            for pattern, factor in _SCALES:
+                if pattern in name:
+                    grad.mul_(factor)
+                    scaled += 1
+                    break
+    if not _scale_logged:
+        _scale_logged = True
+        logger.info("scaled gradients: %s tensors=%d", _SCALES, scaled)
+        assert scaled > 0, f"{SCALE_ENV_VAR}={_SCALES} matches no parameter"
+
+
+@torch.no_grad()
 def maybe_zero_frozen_grads(model_chunks) -> None:
-    """Zero the gradients MILES_FREEZE_PARAMS names."""
+    """Zero the gradients MILES_FREEZE_PARAMS names and scale those MILES_GRAD_SCALE names."""
     global _logged
+    if _SCALES:
+        _scale_grads(model_chunks)
     if not _ENTRIES:
         return
     frozen, free, frozen_elements, free_elements, qkv_layers, qkv_rows = 0, 0, 0, 0, 0, 0

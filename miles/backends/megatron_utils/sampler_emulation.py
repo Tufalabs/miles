@@ -18,7 +18,8 @@ Enabled by the environment variable MILES_SAMPLER_EMULATION, a comma-separated l
   out_fp8    the attention output cast to FP8 E4M3 and back
 MILES_SAMPLER_EMULATION_STATS=1 logs, once per layer, where K, V, the query and the attention output sit
 against the formats' ranges (it can be set without any part, to measure only).
-With MILES_GAIN_PENALTY set (loss/hub/gain_penalty.py) the parts apply only inside that penalty's rounded pass.
+With MILES_GAIN_PENALTY or MILES_GAIN_PROJECTION set (loss/hub/gain_penalty.py) the parts apply only inside
+the penalty's rounded pass.
 MILES_SAMPLER_EMULATION_LAYERS=<first>-<last> restricts the parts to those layers (inclusive); default all.
 MILES_SAMPLER_EMULATION_SCORE_STATS=1 logs, once per layer, what K's NVFP4 rounding does to the attention
 scores and patterns of the first sequences of the first batch (it can be set without any part).
@@ -236,7 +237,7 @@ def _wrap_core_attention(
             logger.info("sampler emulation stats %s K: %s", name, _block_scale_stats(key))
             logger.info("sampler emulation stats %s V: %s", name, _block_scale_stats(value))
             logger.info("sampler emulation stats %s Q: %s", name, _element_stats(query))
-        if gain_penalty.enabled() and not gain_penalty.rounding_active():
+        if gain_penalty.configured() and not gain_penalty.rounding_active():
             # with the gain penalty the emulation applies only in its rounded pass
             return original_forward(query, key, value, *args, **kwargs)
         kernel = "kv_nvfp4_kernel" in parts
