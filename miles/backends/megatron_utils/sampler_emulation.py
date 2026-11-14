@@ -20,6 +20,7 @@ MILES_SAMPLER_EMULATION_STATS=1 logs, once per layer, where K, V, the query and 
 against the formats' ranges (it can be set without any part, to measure only).
 With MILES_GAIN_PENALTY or MILES_GAIN_PROJECTION set (loss/hub/gain_penalty.py) the parts apply only inside
 the penalty's rounded pass.
+MILES_SAMPLER_EMULATION_DIVERGENCE=1 compares the rounded and the plain pass layer by layer (emulation_divergence.py).
 MILES_SAMPLER_EMULATION_LAYERS=<first>-<last> restricts the parts to those layers (inclusive); default all.
 MILES_SAMPLER_EMULATION_SCORE_STATS=1 logs, once per layer, what K's NVFP4 rounding does to the attention
 scores and patterns of the first sequences of the first batch (it can be set without any part).
@@ -31,6 +32,7 @@ import os
 
 import torch
 
+from miles.backends.megatron_utils import emulation_divergence
 from miles.backends.megatron_utils.megatron_to_hf.v_scale_folding import _LOG2_SCALES as _V_LOG2_SCALES
 from miles.backends.training_utils.loss.hub import gain_penalty
 from miles.kernels.quant.fake_quant import COMPRESSED_KV_BLOCK_SIZE, fake_quant_compressed_kv
@@ -283,8 +285,16 @@ def maybe_install_sampler_emulation(model_chunks) -> None:
                 layer = int(name.split(".layers.")[1].split(".")[0])
                 v_scale = 2.0 ** _V_LOG2_SCALES[layer] if _V_LOG2_SCALES is not None else 1.0
                 layer_parts = parts if first <= layer <= last else frozenset()
-                _wrap_core_attention(module.core_attention, layer_parts, name if stats else None, v_scale, name if score_stats else None)
+                _wrap_core_attention(
+                    module.core_attention,
+                    layer_parts,
+                    name if stats else None,
+                    v_scale,
+                    name if score_stats else None,
+                    layer_name=name.removesuffix(".self_attention"),
+                )
                 wrapped += 1
                 emulating += bool(layer_parts)
     assert wrapped > 0, f"{ENV_VAR} is set but no self_attention.core_attention module was found"
     logger.info("sampler emulation installed: parts=%s in %d of %d layers (layers %d to %d)", sorted(parts), emulating, wrapped, first, last)
+    emulation_divergence.maybe_install(model_chunks)
