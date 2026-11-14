@@ -75,7 +75,8 @@ def maybe_zero_frozen_grads(model_chunks) -> None:
             grad = _grad_of(linear_qkv.weight)
             if grad is None:
                 continue
-            assert getattr(linear_qkv, "bias", None) is None, "qkv_rows does not handle a QKV bias"
+            bias = getattr(linear_qkv, "bias", None)  # Transformer Engine keeps an empty tensor when there is none
+            assert bias is None or bias.numel() == 0, "qkv_rows does not handle a QKV bias"
             qkv_layers += 1
             qkv_rows += zero_qkv_rows(module, grad, _QKV_PARTS)
     if not _logged:
