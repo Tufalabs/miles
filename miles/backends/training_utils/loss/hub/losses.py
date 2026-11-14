@@ -10,7 +10,7 @@ from miles.backends.training_utils.data.context_parallel import (
     get_sum_of_sample_mean,
 )
 from miles.backends.training_utils.data.sampling_mask import get_rollout_sampling_masks
-from miles.backends.training_utils.loss.hub import gain_penalty
+from miles.backends.training_utils.loss.hub import gain_penalty, rollout_kl
 from miles.backends.training_utils.loss.hub.corrections import vanilla_tis_function
 from miles.backends.training_utils.loss.hub.logit_processors import get_log_probs_and_entropy, get_values
 from miles.backends.training_utils.loss.hub.math_utils import (
@@ -215,6 +215,13 @@ def policy_loss_function(
     gain_penalty_metrics: dict[str, torch.Tensor] = {}
     if gain_penalty.enabled():
         pg_loss, gain_penalty_metrics = gain_penalty.apply(batch, pg_loss, log_probs, active_tokens)
+
+    if rollout_kl.enabled() and not gain_penalty.quiet():
+        assert rollout_old_log_probs is not None, "MILES_ROLLOUT_KL needs rollout log-probs in the batch"
+        pg_loss, rollout_kl_metrics = rollout_kl.apply(
+            pg_loss, log_probs, torch.cat(rollout_old_log_probs, dim=0), active_tokens
+        )
+        gain_penalty_metrics = {**gain_penalty_metrics, **rollout_kl_metrics}
 
     if args.dump_details is not None and not gain_penalty.quiet():
         from miles.backends.training_utils.metrics.debug_dump import maybe_dump_policy_loss_debug
