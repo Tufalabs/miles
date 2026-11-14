@@ -18,6 +18,8 @@ Enabled by the environment variable MILES_SAMPLER_EMULATION, a comma-separated l
   out_fp8    the attention output cast to FP8 E4M3 and back
 MILES_SAMPLER_EMULATION_STATS=1 logs, once per layer, where K, V, the query and the attention output sit
 against the formats' ranges (it can be set without any part, to measure only).
+MILES_SAMPLER_EMULATION_SCORE_STATS=1 logs, once per layer, what K's NVFP4 rounding does to the attention
+scores and patterns of the first sequences of the first batch (it can be set without any part).
 CUDA only (Triton kernel).
 """
 
@@ -33,6 +35,8 @@ logger = logging.getLogger(__name__)
 
 ENV_VAR = "MILES_SAMPLER_EMULATION"
 STATS_ENV_VAR = "MILES_SAMPLER_EMULATION_STATS"
+SCORE_STATS_ENV_VAR = "MILES_SAMPLER_EMULATION_SCORE_STATS"
+_SCORE_STATS_SEQUENCES = 8
 _E4M3_MIN_NORMAL = 2.0**-6
 _E4M3_MIN_SUBNORMAL = 2.0**-9
 PARTS = (
@@ -142,34 +146,87 @@ def _block_scale_stats(x: torch.Tensor) -> str:
     blocks = x.detach().float().reshape(-1, COMPRESSED_KV_BLOCK_SIZE)
     scale = blocks.abs().amax(dim=-1) / 6.0
     quantiles = torch.quantile(scale[:: max(1, scale.numel() // 200_000)], torch.tensor([0.01, 0.1, 0.5, 0.9], device=scale.device))
-    return (
-        f"scale q01={quantiles[0]:.2e} q10={quantiles[1]:.2e} q50={quantiles[2]:.2e} q90={quantiles[3]:.2e}"
-        f" zeroed={(scale < _E4M3_MIN_SUBNORMAL / 2).float().mean():.4f}"
-        f" subnormal={(scale < _E4M3_MIN_NORMAL).float().mean():.4f}"
-    )
+    return f"scale q01={quantiles[0]:.2e} q10={quantiles[1]:.2e} q50={quantiles[2]:.2e} q90={quantiles[3]:.2e} zeroed={(scale < _E4M3_MIN_SUBNORMAL / 2).float().mean():.4f} subnormal={(scale < _E4M3_MIN_NORMAL).float().mean():.4f}"
 
 
 def _element_stats(x: torch.Tensor) -> str:
     """Where the elements of a tensor that is cast to FP8 E4M3 at scale 1 fall."""
     mag = x.detach().float().abs().flatten()
     quantiles = torch.quantile(mag[:: max(1, mag.numel() // 200_000)], torch.tensor([0.1, 0.5, 0.9], device=mag.device))
-    return (
-        f"abs q10={quantiles[0]:.2e} q50={quantiles[1]:.2e} q90={quantiles[2]:.2e} max={mag.max():.2e}"
-        f" to_zero={(mag < _E4M3_MIN_SUBNORMAL / 2).float().mean():.4f}"
-        f" subnormal={(mag < _E4M3_MIN_NORMAL).float().mean():.4f} above_448={(mag > 448).float().mean():.6f}"
-    )
+    return f"abs q10={quantiles[0]:.2e} q50={quantiles[1]:.2e} q90={quantiles[2]:.2e} max={mag.max():.2e} to_zero={(mag < _E4M3_MIN_SUBNORMAL / 2).float().mean():.4f} subnormal={(mag < _E4M3_MIN_NORMAL).float().mean():.4f} above_448={(mag > 448).float().mean():.6f}"
+
+
+@torch.no_grad()
+def _score_stats(query: torch.Tensor, key: torch.Tensor, packed_seq_params) -> str:
+    """What K's NVFP4 rounding does to the attention scores q.k / sqrt(head_dim) and to the attention patterns.
+
+    Over the first sequences of a packed batch (query [tokens, heads, head_dim], key [tokens, groups,
+    head_dim]) and every head, with a causal mask:
+      rel_k_err   |K rounded - K| / |K| (RMS over elements)
+      score_err   RMS of the score error over query-key pairs
+      score_std   the spread of a query's scores over its keys (mean over queries)
+      tv, tv_p99  total variation between the exact and the rounded attention pattern of a query: mean, 99th
+                  percentile over queries
+      kl          KL(exact pattern || rounded pattern), mean over queries
+      entropy, p_max  of the exact pattern, mean over queries
+    """
+    bounds = packed_seq_params.cu_seqlens_host
+    heads, groups, head_dim = query.shape[1], key.shape[1], query.shape[2]
+    rounded_key = _nvfp4_round_trip(key)
+    sums = dict.fromkeys(("score_err2", "pairs", "score_std", "tv", "kl", "entropy", "p_max", "queries"), 0.0)
+    tvs = []
+    sequences = min(_SCORE_STATS_SEQUENCES, len(bounds) - 1)
+    for start, end in zip(bounds[:sequences], bounds[1 : sequences + 1], strict=True):
+        length = end - start
+        q = query[start:end].float().transpose(0, 1)  # [heads, length, head_dim]
+        causal = torch.ones(length, length, dtype=torch.bool, device=q.device).tril()
+        patterns = []
+        for k in (key, rounded_key):
+            k = k[start:end].float().transpose(0, 1).repeat_interleave(heads // groups, dim=0)
+            scores = q @ k.transpose(1, 2) / head_dim**0.5  # [heads, query, key]
+            patterns.append((scores, scores.masked_fill(~causal, float("-inf")).log_softmax(dim=-1)))
+        (scores, log_p), (rounded_scores, log_p_rounded) = patterns
+        p = log_p.exp()
+        count = causal.sum() * heads
+        mean = (scores * causal).sum(-1) / causal.sum(-1)
+        variance = (((scores - mean[..., None]) ** 2) * causal).sum(-1) / causal.sum(-1)
+        tv = 0.5 * (p - log_p_rounded.exp()).abs().sum(-1)
+        tvs.append(tv.flatten())
+        sums["score_err2"] += (((rounded_scores - scores) ** 2) * causal).sum().item()
+        sums["pairs"] += count.item()
+        sums["score_std"] += variance.sqrt().sum().item()
+        sums["tv"] += tv.sum().item()
+        sums["kl"] += (p * (log_p - log_p_rounded).masked_fill(~causal, 0.0)).sum().item()
+        sums["entropy"] += -(p * log_p.masked_fill(~causal, 0.0)).sum().item()
+        sums["p_max"] += p.amax(-1).sum().item()
+        sums["queries"] += heads * length
+    tv_all = torch.cat(tvs)
+    tv_p99 = torch.quantile(tv_all[:: max(1, tv_all.numel() // 1_000_000)], 0.99).item()
+    rel_k_err = ((rounded_key.float() - key.float()).pow(2).mean() / key.float().pow(2).mean()).sqrt().item()
+    n = sums["queries"]
+    return f"sequences={sequences} queries={int(n)} rel_k_err={rel_k_err:.4e} score_err={(sums['score_err2'] / sums['pairs']) ** 0.5:.4e} score_std={sums['score_std'] / n:.4e} tv={sums['tv'] / n:.4e} tv_p99={tv_p99:.4e} kl={sums['kl'] / n:.4e} entropy={sums['entropy'] / n:.4e} p_max={sums['p_max'] / n:.4e}"
 
 
 def _wrap_core_attention(
-    core_attention: torch.nn.Module, parts: frozenset[str], stats_name: str | None, v_scale: float
+    core_attention: torch.nn.Module,
+    parts: frozenset[str],
+    stats_name: str | None,
+    v_scale: float,
+    score_stats_name: str | None = None,
 ) -> None:
     """`v_scale`: the factor the sampler's V carries (MILES_SAMPLER_V_SCALE_LOG2); V is quantized at that scale."""
     original_forward = core_attention.forward
     pending_stats = [stats_name] if stats_name is not None else []
     pending_output_stats = list(pending_stats)
+    pending_score_stats = [score_stats_name] if score_stats_name is not None else []
     k_rms: list[torch.Tensor] = []
 
     def forward(query, key, value, *args, **kwargs):
+        if pending_score_stats:
+            name = pending_score_stats.pop()
+            packed = kwargs.get("packed_seq_params")
+            assert packed is not None and query.dim() == 3, "score stats need packed sequences (qkv_format thd)"
+            logger.info("sampler emulation score stats %s: %s", name, _score_stats(query, key, packed))
         if pending_stats:
             name = pending_stats.pop()
             logger.info("sampler emulation stats %s K: %s", name, _block_scale_stats(key))
@@ -180,8 +237,7 @@ def _wrap_core_attention(
             if not k_rms:
                 k_rms.append(_pair_rms(key))
                 ratio = k_rms[0].max() / k_rms[0].min()
-                logger.info("sampler emulation K rms per coordinate: min=%.3e median=%.3e max=%.3e max/min=%.1f",
-                            k_rms[0].min(), k_rms[0].median(), k_rms[0].max(), ratio)
+                logger.info("sampler emulation K rms per coordinate: min=%.3e median=%.3e max=%.3e max/min=%.1f", k_rms[0].min(), k_rms[0].median(), k_rms[0].max(), ratio)
             key = _nvfp4_equalized(key, k_rms[0])
         elif "k_nvfp4_rotated" in parts:
             key = _nvfp4_rotated(key)
@@ -205,7 +261,8 @@ def maybe_install_sampler_emulation(model_chunks) -> None:
     """Wrap every layer's core attention when MILES_SAMPLER_EMULATION is set."""
     spec = os.environ.get(ENV_VAR, "").strip()
     stats = os.environ.get(STATS_ENV_VAR, "") == "1"
-    if not spec and not stats:
+    score_stats = os.environ.get(SCORE_STATS_ENV_VAR, "") == "1"
+    if not spec and not stats and not score_stats:
         return
     parts = frozenset(part.strip() for part in spec.split(",") if part.strip())
     unknown = parts - set(PARTS)
@@ -216,7 +273,7 @@ def maybe_install_sampler_emulation(model_chunks) -> None:
             if name.endswith("self_attention") and hasattr(module, "core_attention"):
                 layer = int(name.split(".layers.")[1].split(".")[0])
                 v_scale = 2.0 ** _V_LOG2_SCALES[layer] if _V_LOG2_SCALES is not None else 1.0
-                _wrap_core_attention(module.core_attention, parts, name if stats else None, v_scale)
+                _wrap_core_attention(module.core_attention, parts, name if stats else None, v_scale, name if score_stats else None)
                 wrapped += 1
     assert wrapped > 0, f"{ENV_VAR} is set but no self_attention.core_attention module was found"
     logger.info("sampler emulation installed: parts=%s layers=%d", sorted(parts), wrapped)
