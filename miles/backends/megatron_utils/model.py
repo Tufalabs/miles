@@ -84,6 +84,7 @@ def _has_loadable_ckpt(load_dir: str | None) -> bool:
 
 
 from .fp32_param_utils import enforce_marked_param_dtypes
+from .emulation_divergence import maybe_save_trace
 from .freeze_params import maybe_zero_frozen_grads
 from .gain_projection import penalty_gradient, project_out_penalty_gradient
 from .grad_sketch import maybe_save_grad_sketch
@@ -653,6 +654,7 @@ def train_one_step(
         project_out_penalty_gradient(model, gain_penalty_grads, rollout_id)
     maybe_zero_frozen_grads(model)
     maybe_save_grad_sketch(model, args.dump_details, rollout_id, step_id)
+    maybe_save_trace(args.dump_details, rollout_id)
     if args.enable_sample_ownership_checker:
         local_consumed_identities = SampleIdentityExtractor.get_consumed_sample_identities(
             start_offset=sample_consumption_start,
