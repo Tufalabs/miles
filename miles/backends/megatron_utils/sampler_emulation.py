@@ -18,6 +18,7 @@ Enabled by the environment variable MILES_SAMPLER_EMULATION, a comma-separated l
   out_fp8    the attention output cast to FP8 E4M3 and back
 MILES_SAMPLER_EMULATION_STATS=1 logs, once per layer, where K, V, the query and the attention output sit
 against the formats' ranges (it can be set without any part, to measure only).
+With MILES_GAIN_PENALTY set (loss/hub/gain_penalty.py) the parts apply only inside that penalty's rounded pass.
 MILES_SAMPLER_EMULATION_LAYERS=<first>-<last> restricts the parts to those layers (inclusive); default all.
 MILES_SAMPLER_EMULATION_SCORE_STATS=1 logs, once per layer, what K's NVFP4 rounding does to the attention
 scores and patterns of the first sequences of the first batch (it can be set without any part).
@@ -30,6 +31,7 @@ import os
 import torch
 
 from miles.backends.megatron_utils.megatron_to_hf.v_scale_folding import _LOG2_SCALES as _V_LOG2_SCALES
+from miles.backends.training_utils.loss.hub import gain_penalty
 from miles.kernels.quant.fake_quant import COMPRESSED_KV_BLOCK_SIZE, fake_quant_compressed_kv
 
 logger = logging.getLogger(__name__)
@@ -234,6 +236,9 @@ def _wrap_core_attention(
             logger.info("sampler emulation stats %s K: %s", name, _block_scale_stats(key))
             logger.info("sampler emulation stats %s V: %s", name, _block_scale_stats(value))
             logger.info("sampler emulation stats %s Q: %s", name, _element_stats(query))
+        if gain_penalty.enabled() and not gain_penalty.rounding_active():
+            # with the gain penalty the emulation applies only in its rounded pass
+            return original_forward(query, key, value, *args, **kwargs)
         kernel = "kv_nvfp4_kernel" in parts
         if "k_nvfp4_equalized" in parts:
             if not k_rms:

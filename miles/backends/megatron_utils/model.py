@@ -29,6 +29,7 @@ from miles.backends.megatron_utils.lora.native import wrap_model_provider_with_l
 from miles.backends.megatron_utils.optimizer_state_reset import reset_optimizer_states
 from miles.backends.training_utils.data.rollout import DataIterator, get_batch
 from miles.backends.training_utils.data.sampling_mask import get_rollout_sampling_masks
+from miles.backends.training_utils.loss.hub import gain_penalty
 from miles.backends.training_utils.loss.objective import loss_function
 from miles.backends.training_utils.metrics.checks import check_grad_norm, check_kl
 from miles.backends.training_utils.metrics.debug_dump import training_rollout_scope
@@ -548,9 +549,24 @@ def run_forward_backward_pass(
             if (x := batch["multimodal_train_inputs"]) is not None:
                 forward_kwargs.update(x)
 
-            output_tensor = model(
-                **forward_kwargs, fp32_output=args.loss_type not in ("policy_loss", "sft_loss", "score_centering")
-            )
+            fp32_output = args.loss_type not in ("policy_loss", "sft_loss", "score_centering")
+            if gain_penalty.enabled() and torch.is_grad_enabled():
+                # the penalty's rounded pass: a forward with the sampler emulation on whose loss is the
+                # penalty alone; its gradient accumulates with the plain pass below
+                with gain_penalty.rounded_pass():
+                    rounded_logits = model(**forward_kwargs, fp32_output=fp32_output)
+                    rounded_loss, _, _ = loss_function(
+                        args,
+                        batch,
+                        num_microbatches,
+                        rounded_logits,
+                        apply_megatron_loss_scaling=True,
+                        num_rollouts=num_rollouts,
+                    )
+                    rounded_loss.backward()
+                del rounded_logits, rounded_loss
+
+            output_tensor = model(**forward_kwargs, fp32_output=fp32_output)
 
         for m, old_stage in zip(all_replay_managers, old_stages, strict=True):
             m.stage = old_stage

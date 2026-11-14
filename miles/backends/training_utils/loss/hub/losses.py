@@ -10,6 +10,7 @@ from miles.backends.training_utils.data.context_parallel import (
     get_sum_of_sample_mean,
 )
 from miles.backends.training_utils.data.sampling_mask import get_rollout_sampling_masks
+from miles.backends.training_utils.loss.hub import gain_penalty
 from miles.backends.training_utils.loss.hub.corrections import vanilla_tis_function
 from miles.backends.training_utils.loss.hub.logit_processors import get_log_probs_and_entropy, get_values
 from miles.backends.training_utils.loss.hub.math_utils import (
@@ -211,7 +212,11 @@ def policy_loss_function(
 
     pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, args.eps_clip, args.eps_clip_high, args.eps_clip_c)
 
-    if args.dump_details is not None:
+    gain_penalty_metrics: dict[str, torch.Tensor] = {}
+    if gain_penalty.enabled():
+        pg_loss, gain_penalty_metrics = gain_penalty.apply(batch, pg_loss, log_probs, old_log_probs, active_tokens)
+
+    if args.dump_details is not None and not gain_penalty.rounding_active():
         from miles.backends.training_utils.metrics.debug_dump import maybe_dump_policy_loss_debug
 
         maybe_dump_policy_loss_debug(
@@ -381,6 +386,9 @@ def policy_loss_function(
         reported_loss["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff.clone().detach()
     if train_rollout_kl is not None:
         reported_loss["train_rollout_kl"] = train_rollout_kl.clone().detach()
+
+    for metric_key, metric_value in gain_penalty_metrics.items():
+        reported_loss[metric_key] = sum_of_sample_mean(metric_value).clone().detach()
 
     if args.use_kl_loss:
         reported_loss["kl_loss"] = kl_loss.clone().detach()
