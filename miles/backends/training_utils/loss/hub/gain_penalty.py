@@ -8,9 +8,11 @@ policy loss gains the term
 where p_plain is the trainer's forward as it is and p_rounded the same weights with the sampler emulation on.
 Both forwards carry gradient, in two passes over each micro-batch that accumulate into the same gradient:
 
-  rounded pass  the emulation is on; the loss is the penalty against the plain log-probs of the no-grad
-                scoring pass (`batch["log_probs"]`); its log-probs are kept on the batch
-  plain pass    the usual forward; the loss is the policy loss plus the penalty against the kept log-probs
+  scoring pass  a plain forward without gradient that keeps the plain log-probs on the batch (the run may have
+                no separate scoring pass: --skip-actor-forward-only)
+  rounded pass  the emulation is on; the loss is the penalty against the kept plain log-probs; its log-probs
+                are kept on the batch too
+  plain pass    the usual forward; the loss is the policy loss plus the penalty against the rounded log-probs
 
 Outside the rounded pass the emulation is off, so scoring and the policy term see the plain model. The huber
 threshold is MILES_GAIN_PENALTY_DELTA (default 1 nat). Metrics, from the plain pass: `gain_d2` (mean squared
@@ -33,11 +35,18 @@ _COEFFICIENT = float(os.environ.get(ENV_VAR, "0"))
 _DELTA = float(os.environ.get(DELTA_ENV_VAR, "1"))
 PROJECTION_ENV_VAR = "MILES_GAIN_PROJECTION"
 _PROJECTION = os.environ.get(PROJECTION_ENV_VAR, "") == "1"
-assert not (_PROJECTION and _COEFFICIENT > 0), f"set {ENV_VAR} or {PROJECTION_ENV_VAR}, not both"
+assert not (_PROJECTION and _COEFFICIENT > 0), (
+    f"set {ENV_VAR} or {PROJECTION_ENV_VAR}, not both"
+)
 _ROUNDED_LOG_PROBS_KEY = "gain_penalty_rounded_log_probs"
+_PLAIN_LOG_PROBS_KEY = "gain_penalty_plain_log_probs"
 _rounding_active = False
+_scoring = False
 _penalty_phase = False
-_phase_sums = [0.0, 0.0]  # of the current penalty phase: sum of squared differences, supervised tokens
+_phase_sums = [
+    0.0,
+    0.0,
+]  # of the current penalty phase: sum of squared differences, supervised tokens
 
 
 def configured() -> bool:
@@ -81,6 +90,22 @@ def rounding_active() -> bool:
 
 
 @contextlib.contextmanager
+def scoring_pass():
+    """A plain forward whose only purpose is to leave the plain log-probs on the batch."""
+    global _scoring
+    _scoring = True
+    try:
+        yield
+    finally:
+        _scoring = False
+
+
+def quiet() -> bool:
+    """True in the penalty's own passes, which must not write the per-token debug dumps."""
+    return _scoring or _rounding_active or _penalty_phase
+
+
+@contextlib.contextmanager
 def rounded_pass():
     global _rounding_active
     _rounding_active = True
@@ -92,34 +117,55 @@ def rounded_pass():
 
 def _huber(d: torch.Tensor) -> torch.Tensor:
     magnitude = d.abs()
-    return torch.where(magnitude <= _DELTA, 0.5 * d * d, _DELTA * (magnitude - 0.5 * _DELTA))
+    return torch.where(
+        magnitude <= _DELTA, 0.5 * d * d, _DELTA * (magnitude - 0.5 * _DELTA)
+    )
 
 
 def apply(
     batch: dict,
     pg_loss: torch.Tensor,
     log_probs: torch.Tensor,
-    plain_log_probs: torch.Tensor,
     active_tokens: torch.Tensor,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """The per-token loss of the current pass and, in the plain pass, per-token metrics.
 
-    `log_probs`: this forward's log-probs of the sampled tokens (with gradient). `plain_log_probs`: the plain
-    trainer's from the no-grad scoring pass.
+    `log_probs`: this forward's log-probs of the sampled tokens.
     """
+    if _scoring:
+        batch[_PLAIN_LOG_PROBS_KEY] = log_probs.detach()
+        return pg_loss, {}
     coefficient = 1.0 if _PROJECTION else _COEFFICIENT
     if rounding_active():
         batch[_ROUNDED_LOG_PROBS_KEY] = log_probs.detach()
-        d = plain_log_probs.detach() - log_probs
-        d = torch.where(active_tokens, torch.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0), d.new_zeros(()))
+        plain = batch.get(_PLAIN_LOG_PROBS_KEY)
+        assert plain is not None, (
+            "gain penalty: the scoring pass did not run before the rounded pass"
+        )
+        d = plain - log_probs
+        d = torch.where(
+            active_tokens,
+            torch.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0),
+            d.new_zeros(()),
+        )
         return coefficient * _huber(d), {}
     rounded = batch.get(_ROUNDED_LOG_PROBS_KEY)
-    assert rounded is not None, "gain penalty: the rounded pass did not run before the plain pass"
+    assert rounded is not None, (
+        "gain penalty: the rounded pass did not run before the plain pass"
+    )
     d = log_probs - rounded
-    d = torch.where(active_tokens, torch.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0), d.new_zeros(()))
+    d = torch.where(
+        active_tokens,
+        torch.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0),
+        d.new_zeros(()),
+    )
     penalty = _huber(d)
     detached = d.detach()
-    metrics = {"gain_d2": detached * detached, "gain_abs_d": detached.abs(), "gain_penalty": penalty.detach()}
+    metrics = {
+        "gain_d2": detached * detached,
+        "gain_abs_d": detached.abs(),
+        "gain_penalty": penalty.detach(),
+    }
     if _PROJECTION:  # the penalty phase: the policy term is dropped
         _phase_sums[0] += (detached * detached).sum().item()
         _phase_sums[1] += active_tokens.sum().item()

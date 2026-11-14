@@ -552,8 +552,18 @@ def run_forward_backward_pass(
 
             fp32_output = args.loss_type not in ("policy_loss", "sft_loss", "score_centering")
             if gain_penalty.enabled() and torch.is_grad_enabled():
-                # the penalty's rounded pass: a forward with the sampler emulation on whose loss is the
-                # penalty alone; its gradient accumulates with the plain pass below
+                # the penalty's scoring pass (plain, no gradient: it leaves the plain log-probs on the batch)
+                # and rounded pass (the sampler emulation on, the loss is the penalty alone); the rounded
+                # pass's gradient accumulates with the plain pass below
+                with torch.no_grad(), gain_penalty.scoring_pass():
+                    loss_function(
+                        args,
+                        batch,
+                        num_microbatches,
+                        model(**forward_kwargs, fp32_output=fp32_output),
+                        apply_megatron_loss_scaling=True,
+                        num_rollouts=num_rollouts,
+                    )
                 with gain_penalty.rounded_pass():
                     rounded_logits = model(**forward_kwargs, fp32_output=fp32_output)
                     rounded_loss, _, _ = loss_function(

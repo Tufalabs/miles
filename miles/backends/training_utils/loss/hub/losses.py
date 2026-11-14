@@ -214,9 +214,9 @@ def policy_loss_function(
 
     gain_penalty_metrics: dict[str, torch.Tensor] = {}
     if gain_penalty.enabled():
-        pg_loss, gain_penalty_metrics = gain_penalty.apply(batch, pg_loss, log_probs, old_log_probs, active_tokens)
+        pg_loss, gain_penalty_metrics = gain_penalty.apply(batch, pg_loss, log_probs, active_tokens)
 
-    if args.dump_details is not None and not (gain_penalty.rounding_active() or gain_penalty.in_penalty_phase()):
+    if args.dump_details is not None and not gain_penalty.quiet():
         from miles.backends.training_utils.metrics.debug_dump import maybe_dump_policy_loss_debug
 
         maybe_dump_policy_loss_debug(
