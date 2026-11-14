@@ -220,6 +220,7 @@ def _wrap_core_attention(
     stats_name: str | None,
     v_scale: float,
     score_stats_name: str | None = None,
+    layer_name: str = "",
 ) -> None:
     """`v_scale`: the factor the sampler's V carries (MILES_SAMPLER_V_SCALE_LOG2); V is quantized at that scale."""
     original_forward = core_attention.forward
@@ -241,6 +242,8 @@ def _wrap_core_attention(
             logger.info("sampler emulation stats %s Q: %s", name, _element_stats(query))
         if gain_penalty.configured() and not gain_penalty.rounding_active():
             # with the gain penalty the emulation applies only in its rounded pass
+            if emulation_divergence.enabled():
+                emulation_divergence.compare_patterns(layer_name, query, key, kwargs.get("packed_seq_params"))
             return original_forward(query, key, value, *args, **kwargs)
         kernel = "kv_nvfp4_kernel" in parts
         if "k_nvfp4_equalized" in parts:
@@ -257,6 +260,8 @@ def _wrap_core_attention(
             value = _nvfp4_kv(value * v_scale, kernel) * (1.0 / v_scale)
         if "q_fp8" in parts:
             query = _fp8_straight_through(query)
+        if emulation_divergence.enabled():
+            emulation_divergence.compare_patterns(layer_name, query, key, kwargs.get("packed_seq_params"))
         output = original_forward(query, key, value, *args, **kwargs)
         if pending_output_stats:
             logger.info("sampler emulation stats %s OUT: %s", pending_output_stats.pop(), _element_stats(output))
