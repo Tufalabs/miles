@@ -62,7 +62,9 @@ def _compare(name: str, kind: str, rounded: torch.Tensor, plain: torch.Tensor) -
 
 def _hook(name: str, kind: str, layer: int):
     def hook(module, inputs, output):
-        if not _state["armed"] or not torch.is_grad_enabled():
+        # No test of the grad mode: Megatron's activation recompute runs a layer's first forward without grad.
+        # The scoring pass before the rounded pass finds nothing stored and is skipped that way.
+        if not _state["armed"]:
             return
         key = f"{name}/{kind}"
         value = (output[1] if kind == "router" else _first(output))[:_TOKENS].detach()
@@ -104,7 +106,7 @@ def _patterns(query: torch.Tensor, key: torch.Tensor, bounds) -> list[torch.Tens
 def compare_patterns(name: str, query: torch.Tensor, key: torch.Tensor, packed_seq_params) -> None:
     """Called by the emulation wrapper with the query and the key this pass attends with (the rounded key in
     a rounded pass of a layer that rounds). Stores them in the rounded pass, compares in the plain pass."""
-    if not _state["armed"] or not torch.is_grad_enabled() or packed_seq_params is None:
+    if not _state["armed"] or packed_seq_params is None:
         return
     bounds = packed_seq_params.cu_seqlens_host
     bounds = bounds[: min(_SEQUENCES, len(bounds) - 1) + 1]
