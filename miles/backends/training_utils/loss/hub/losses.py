@@ -214,7 +214,13 @@ def policy_loss_function(
 
     gain_penalty_metrics: dict[str, torch.Tensor] = {}
     if gain_penalty.enabled():
-        pg_loss, gain_penalty_metrics = gain_penalty.apply(batch, pg_loss, log_probs, active_tokens)
+        pg_loss, gain_penalty_metrics = gain_penalty.apply(
+            batch,
+            pg_loss,
+            log_probs,
+            active_tokens,
+            torch.cat(rollout_old_log_probs, dim=0) if rollout_old_log_probs else None,
+        )
 
     if rollout_kl.enabled() and not gain_penalty.quiet():
         assert rollout_old_log_probs is not None, "MILES_ROLLOUT_KL needs rollout log-probs in the batch"

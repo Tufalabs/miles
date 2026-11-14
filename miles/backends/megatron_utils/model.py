@@ -551,7 +551,7 @@ def run_forward_backward_pass(
                 forward_kwargs.update(x)
 
             fp32_output = args.loss_type not in ("policy_loss", "sft_loss", "score_centering")
-            if gain_penalty.enabled() and torch.is_grad_enabled():
+            if gain_penalty.needs_rounded_pass() and torch.is_grad_enabled():
                 # the penalty's scoring pass (plain, no gradient: it leaves the plain log-probs on the batch)
                 # and rounded pass (the sampler emulation on, the loss is the penalty alone); the rounded
                 # pass's gradient accumulates with the plain pass below

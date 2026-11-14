@@ -21,7 +21,9 @@ difference), `gain_abs_d` (mean absolute difference), `gain_penalty` (the term b
 MILES_GAIN_PROJECTION=1 (in place of the coefficient) does not add the penalty to the loss. Each training step
 first computes the penalty's own gradient (the penalty phase: both passes with the policy term dropped), then
 the policy gradient as usual, and removes from the policy gradient its component along the penalty's gradient
-when that component would raise the penalty (megatron_utils/gain_projection.py).
+when that component would raise the penalty (megatron_utils/gain_projection.py). With
+MILES_GAIN_PROJECTION_TARGET=rollout the penalty is huber(log p_plain - log p_rollout) on the sampled tokens,
+the rollout engine's log-probs taken from the batch: one plain forward, no emulation.
 """
 
 import contextlib
@@ -35,9 +37,14 @@ _COEFFICIENT = float(os.environ.get(ENV_VAR, "0"))
 _DELTA = float(os.environ.get(DELTA_ENV_VAR, "1"))
 PROJECTION_ENV_VAR = "MILES_GAIN_PROJECTION"
 _PROJECTION = os.environ.get(PROJECTION_ENV_VAR, "") == "1"
-assert not (_PROJECTION and _COEFFICIENT > 0), (
-    f"set {ENV_VAR} or {PROJECTION_ENV_VAR}, not both"
-)
+# What the projection's penalty compares the plain forward with: "emulation" (the same weights with the sampler
+# emulation on, gradient through both forwards) or "rollout" (the rollout engine's log-probs of the batch, a
+# constant: one forward, no emulation needed).
+TARGET_ENV_VAR = "MILES_GAIN_PROJECTION_TARGET"
+_TARGET = os.environ.get(TARGET_ENV_VAR, "emulation")
+assert _TARGET in ("emulation", "rollout"), f"{TARGET_ENV_VAR}={_TARGET!r}: expected emulation or rollout"
+assert _TARGET == "emulation" or _PROJECTION, f"{TARGET_ENV_VAR}=rollout is for {PROJECTION_ENV_VAR}=1"
+assert not (_PROJECTION and _COEFFICIENT > 0), f"set {ENV_VAR} or {PROJECTION_ENV_VAR}, not both"
 _ROUNDED_LOG_PROBS_KEY = "gain_penalty_rounded_log_probs"
 _PLAIN_LOG_PROBS_KEY = "gain_penalty_plain_log_probs"
 _rounding_active = False
@@ -84,6 +91,11 @@ def phase_sums() -> tuple[float, float]:
     return _phase_sums[0], _phase_sums[1]
 
 
+def needs_rounded_pass() -> bool:
+    """The pass that runs now needs the scoring and rounded passes before its plain forward."""
+    return enabled() and _TARGET == "emulation"
+
+
 def rounding_active() -> bool:
     """True inside the rounded pass: the sampler emulation applies only then when the penalty is enabled."""
     return _rounding_active
@@ -117,9 +129,7 @@ def rounded_pass():
 
 def _huber(d: torch.Tensor) -> torch.Tensor:
     magnitude = d.abs()
-    return torch.where(
-        magnitude <= _DELTA, 0.5 * d * d, _DELTA * (magnitude - 0.5 * _DELTA)
-    )
+    return torch.where(magnitude <= _DELTA, 0.5 * d * d, _DELTA * (magnitude - 0.5 * _DELTA))
 
 
 def apply(
@@ -127,11 +137,22 @@ def apply(
     pg_loss: torch.Tensor,
     log_probs: torch.Tensor,
     active_tokens: torch.Tensor,
+    rollout_log_probs: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """The per-token loss of the current pass and, in the plain pass, per-token metrics.
 
-    `log_probs`: this forward's log-probs of the sampled tokens.
+    `log_probs`: this forward's log-probs of the sampled tokens. `rollout_log_probs`: the rollout engine's,
+    used when the projection's target is the rollout.
     """
+    if _TARGET == "rollout":  # the projection's penalty phase against the rollout engine's log-probs
+        assert rollout_log_probs is not None, f"{TARGET_ENV_VAR}=rollout needs rollout log-probs in the batch"
+        d = log_probs - rollout_log_probs.detach()
+        d = torch.where(active_tokens, torch.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0), d.new_zeros(()))
+        penalty = _huber(d)
+        detached = d.detach()
+        _phase_sums[0] += (detached * detached).sum().item()
+        _phase_sums[1] += active_tokens.sum().item()
+        return 0.0 * pg_loss + penalty, {}
     if _scoring:
         batch[_PLAIN_LOG_PROBS_KEY] = log_probs.detach()
         return pg_loss, {}
@@ -139,9 +160,7 @@ def apply(
     if rounding_active():
         batch[_ROUNDED_LOG_PROBS_KEY] = log_probs.detach()
         plain = batch.get(_PLAIN_LOG_PROBS_KEY)
-        assert plain is not None, (
-            "gain penalty: the scoring pass did not run before the rounded pass"
-        )
+        assert plain is not None, "gain penalty: the scoring pass did not run before the rounded pass"
         d = plain - log_probs
         d = torch.where(
             active_tokens,
@@ -150,9 +169,7 @@ def apply(
         )
         return coefficient * _huber(d), {}
     rounded = batch.get(_ROUNDED_LOG_PROBS_KEY)
-    assert rounded is not None, (
-        "gain penalty: the rounded pass did not run before the plain pass"
-    )
+    assert rounded is not None, "gain penalty: the rounded pass did not run before the plain pass"
     d = log_probs - rounded
     d = torch.where(
         active_tokens,
