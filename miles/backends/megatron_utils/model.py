@@ -640,12 +640,13 @@ def train_one_step(
         gain_penalty_grads = None
         if gain_penalty.projection_enabled():
             gain_penalty_grads = penalty_gradient(
-                lambda: run_forward_backward_pass(
-                    args, dumper_phase_util, data_iterator, model, num_microbatches, num_rollouts
+                lambda count: run_forward_backward_pass(
+                    args, dumper_phase_util, data_iterator, model, count, num_rollouts
                 ),
                 data_iterator,
                 model,
                 lambda: _zero_grads(model, optimizer, disable_optimizer),
+                num_microbatches,
             )
         losses_reduced = run_forward_backward_pass(
             args, dumper_phase_util, data_iterator, model, num_microbatches, num_rollouts

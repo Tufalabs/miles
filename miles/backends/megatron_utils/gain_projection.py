@@ -8,6 +8,8 @@ positive. The penalty itself is never added to the loss.
 """
 
 import logging
+import math
+import os
 from collections.abc import Callable, Sequence
 
 import torch
@@ -15,6 +17,10 @@ import torch
 from miles.backends.training_utils.loss.hub import gain_penalty
 
 logger = logging.getLogger(__name__)
+
+FRACTION_ENV_VAR = "MILES_GAIN_PROJECTION_FRACTION"
+_FRACTION = float(os.environ.get(FRACTION_ENV_VAR, "1"))
+assert 0 < _FRACTION <= 1, f"{FRACTION_ENV_VAR}={_FRACTION}: expected a share in (0, 1]"
 
 
 def _named_grads(model_chunks) -> list[tuple[str, torch.Tensor]]:
@@ -27,12 +33,19 @@ def _named_grads(model_chunks) -> list[tuple[str, torch.Tensor]]:
     return out
 
 
-def penalty_gradient(run_pass: Callable[[], object], data_iterator: Sequence, model_chunks, zero_grads: Callable[[], None]) -> list[torch.Tensor]:
-    """The gain penalty's gradient on the step's micro-batches; leaves the gradients zeroed and the data
-    iterators where they were."""
+def penalty_gradient(
+    run_pass: Callable[[int], object],
+    data_iterator: Sequence,
+    model_chunks,
+    zero_grads: Callable[[], None],
+    num_microbatches: int,
+) -> list[torch.Tensor]:
+    """The gain penalty's gradient on the step's first micro-batches (all of them, or the share
+    MILES_GAIN_PROJECTION_FRACTION: the projection needs a direction, and a part of the batch gives one at a
+    part of the cost); leaves the gradients zeroed and the data iterators where they were."""
     offsets = [iterator.offset for iterator in data_iterator]
     with gain_penalty.penalty_phase():
-        run_pass()
+        run_pass(max(1, math.ceil(_FRACTION * num_microbatches)))
     # bf16 halves the copy of an fp32 gradient buffer; the direction keeps 8 bits per element
     snapshot = [grad.to(torch.bfloat16) for _, grad in _named_grads(model_chunks)]
     zero_grads()
