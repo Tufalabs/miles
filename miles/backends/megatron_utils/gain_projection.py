@@ -33,7 +33,8 @@ def penalty_gradient(run_pass: Callable[[], object], data_iterator: Sequence, mo
     offsets = [iterator.offset for iterator in data_iterator]
     with gain_penalty.penalty_phase():
         run_pass()
-    snapshot = [grad.clone() for _, grad in _named_grads(model_chunks)]
+    # bf16 halves the copy of an fp32 gradient buffer; the direction keeps 8 bits per element
+    snapshot = [grad.to(torch.bfloat16) for _, grad in _named_grads(model_chunks)]
     zero_grads()
     for iterator, offset in zip(data_iterator, offsets, strict=True):
         iterator.offset = offset
@@ -65,7 +66,7 @@ def project_out_penalty_gradient(model_chunks, penalty_grads: list[torch.Tensor]
     if projected:
         coefficient = dot / penalty2
         for (_, grad), penalty in zip(named, penalty_grads, strict=True):
-            grad.sub_(penalty, alpha=coefficient)
+            grad.sub_(penalty.to(grad.dtype), alpha=coefficient)
     logger.info(
         "gain projection rollout=%d cos=%.4f policy_norm=%.4e penalty_norm=%.4e removed_share=%.4e gain_d2=%.4e projected=%d",
         rollout_id,
