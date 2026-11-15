@@ -11,6 +11,7 @@ from miles.backends.training_utils.data.context_parallel import (
     slice_log_prob_with_cp,
 )
 from miles.backends.training_utils.data.sampling_mask import rollout_topk_candidate_ids
+from miles.backends.training_utils.loss.hub import gain_penalty
 from miles.backends.training_utils.loss.hub.logit_processors import _iter_response_chunks
 from miles.backends.training_utils.loss.hub.math_utils import compute_approx_kl
 from miles.backends.training_utils.loss.hub.score_centering import (
@@ -18,6 +19,7 @@ from miles.backends.training_utils.loss.hub.score_centering import (
     score_centering_loss,
     selected_log_probs_and_entropy,
 )
+from miles.backends.training_utils.metrics.debug_dump import maybe_dump_score_centering_debug
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.utils.types import RolloutBatch
 
@@ -176,6 +178,24 @@ def score_centering_loss_function(
             mis_high=args.score_centering_mis_high,
         ),
     )
+    # Experiment hooks (LLMT-83): the gain penalty's passes replace or extend the token loss as they do for
+    # plain policy gradient, and the dump steps save the per-token tensors.
+    gain_metrics: dict[str, torch.Tensor] = {}
+    if gain_penalty.enabled():
+        token_loss, gain_metrics = gain_penalty.apply(batch, token_loss, selected[:, 0], active, rollout)
+    if args.dump_details is not None and not gain_penalty.quiet():
+        maybe_dump_score_centering_debug(
+            args,
+            {
+                "train_log_probs": selected[:, 0],
+                "rollout_log_probs": rollout,
+                "advantages": advantages,
+                "active": active,
+                "head_ids": ids,
+                "train_head_log_probs": selected[:, 1:],
+                "rollout_head_log_probs": head,
+            },
+        )
     pg_loss = sum_of_sample_mean(token_loss)
     entropy = torch.cat(probabilities["entropy"]) if "entropy" in probabilities else None
     kl_log_probs = torch.cat(probabilities["kl_log_probs"]) if args.use_kl_loss else None
@@ -185,6 +205,7 @@ def score_centering_loss_function(
     loss = loss + pg_loss
     log.update({key: sum_of_sample_mean(value).detach() for key, value in metrics.as_log_dict().items()})
     log.update(loss=loss.detach(), pg_loss=pg_loss.detach())
+    log.update({key: sum_of_sample_mean(value).detach() for key, value in gain_metrics.items()})
     train_log_probs = torch.where(active, selected[:, 0].detach(), 0.0)
     log["train_rollout_logprob_abs_diff"] = sum_of_sample_mean((train_log_probs - rollout).abs()).detach()
     # Match the policy-loss diagnostic: sampled-token k3 estimate of KL(rollout || train).

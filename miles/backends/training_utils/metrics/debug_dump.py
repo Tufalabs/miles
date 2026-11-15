@@ -95,3 +95,31 @@ def maybe_dump_policy_loss_debug(
         },
         path,
     )
+
+
+def maybe_dump_score_centering_debug(args: Namespace, tensors: dict[str, torch.Tensor]) -> None:
+    """Per-token tensors of the score-centering loss on the dump steps, flat over this rank's response tokens
+    (experiment, LLMT-83): the trainer's and the sampler's log-prob of the sampled token, the advantage, the
+    active mask, and the candidate ids with both log-probs, to `<dump_details>/score_centering_debug/`."""
+    dump_dir = args.dump_details
+    rollout_id = _training_rollout_id
+    if dump_dir is None or (rollout_id is not None and not is_dump_rollout(rollout_id, interval=args.dump_details_interval)):
+        return
+    if get_parallel_state().tp.rank != 0:
+        return
+    global _POLICY_LOSS_DUMP_COUNTER
+    counter = _POLICY_LOSS_DUMP_COUNTER
+    _POLICY_LOSS_DUMP_COUNTER += 1
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    path = Path(dump_dir) / "score_centering_debug" / f"rank_{rank}_call_{counter}.pt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    saved = {}
+    for name, value in tensors.items():
+        value = value.detach()
+        if value.dtype == torch.bool:
+            saved[name] = value.cpu()
+        elif value.dtype in (torch.int32, torch.int64):
+            saved[name] = value.to(torch.int32).cpu()
+        else:
+            saved[name] = value.to(torch.float16).cpu()
+    torch.save({"rank": rank, "rollout_id": rollout_id, "call": counter, **saved}, path)
