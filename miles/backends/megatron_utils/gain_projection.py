@@ -16,7 +16,8 @@ The projection is first order and its direction is an estimate, so the gain stil
 adds a restoring step: with gain the penalty phases' mean squared log-prob difference (smoothed over the
 computed steps) and MILES_GAIN_SERVO_TARGET its value at the start of the run, the gradient gains
 min(k * max(gain / target - 1, 0), 1) * |policy gradient| along the unit penalty direction, a descent step on
-the penalty. At or below the target nothing is added.
+the penalty. At or below the target nothing is added. MILES_GAIN_SERVO_ONLY=1 keeps the restoring step and
+drops the projection.
 """
 
 import logging
@@ -44,6 +45,9 @@ _SERVO = float(os.environ.get(SERVO_ENV_VAR, "0"))
 SERVO_TARGET_ENV_VAR = "MILES_GAIN_SERVO_TARGET"
 _SERVO_TARGET = float(os.environ.get(SERVO_TARGET_ENV_VAR, "0"))
 assert _SERVO >= 0 and (_SERVO == 0 or _SERVO_TARGET > 0), f"{SERVO_ENV_VAR}={_SERVO} needs {SERVO_TARGET_ENV_VAR} > 0"
+SERVO_ONLY_ENV_VAR = "MILES_GAIN_SERVO_ONLY"
+_SERVO_ONLY = os.environ.get(SERVO_ONLY_ENV_VAR, "") == "1"
+assert not _SERVO_ONLY or _SERVO > 0, f"{SERVO_ONLY_ENV_VAR}=1 needs {SERVO_ENV_VAR} > 0"
 _SERVO_SMOOTHING = 0.8  # decay of the gain's average over the steps that compute the penalty
 # The direction kept across steps, the training steps it has served, what the last computed gradient's cosine
 # with the direction before it was, and the smoothed gain.
@@ -140,7 +144,7 @@ def project_out_penalty_gradient(model_chunks, penalty_grads: list[torch.Tensor]
     if _kept["refreshed"]:
         previous = _kept["gain"]
         _kept["gain"] = gain_d2 if previous is None else _SERVO_SMOOTHING * previous + (1 - _SERVO_SMOOTHING) * gain_d2
-    projected = dot < 0 and penalty2 > 0
+    projected = dot < 0 and penalty2 > 0 and not _SERVO_ONLY
     # in units of the policy gradient's norm, along the unit penalty direction
     servo_push = min(_SERVO * max(_kept["gain"] / _SERVO_TARGET - 1, 0.0), 1.0) if _SERVO > 0 and penalty2 > 0 else 0.0
     coefficient = servo_push * (policy2 / penalty2) ** 0.5 if servo_push > 0 else 0.0
