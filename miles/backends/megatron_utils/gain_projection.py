@@ -11,6 +11,12 @@ to step, so it can be kept across steps: MILES_GAIN_PROJECTION_EVERY=N computes 
 and projects the steps between off the kept direction. MILES_GAIN_PROJECTION_EMA=b makes the kept direction an
 average over the computed ones, d <- b d + (1 - b) p / |p|. Each newly computed gradient logs its cosine with
 the direction kept until then (refresh_cos).
+
+The projection is first order and its direction is an estimate, so the gain still creeps up. MILES_GAIN_SERVO=k
+adds a restoring step: with gain the penalty phases' mean squared log-prob difference (smoothed over the
+computed steps) and MILES_GAIN_SERVO_TARGET its value at the start of the run, the gradient gains
+min(k * max(gain / target - 1, 0), 1) * |policy gradient| along the unit penalty direction, a descent step on
+the penalty. At or below the target nothing is added.
 """
 
 import logging
@@ -33,9 +39,15 @@ assert _EVERY >= 1, f"{EVERY_ENV_VAR}={_EVERY}: expected a number of steps, at l
 EMA_ENV_VAR = "MILES_GAIN_PROJECTION_EMA"
 _EMA = float(os.environ.get(EMA_ENV_VAR, "0"))
 assert 0 <= _EMA < 1, f"{EMA_ENV_VAR}={_EMA}: expected a decay in [0, 1)"
-# The direction kept across steps, the training steps it has served, and what the last computed gradient's
-# cosine with the direction before it was.
-_kept: dict = {"direction": None, "age": 0, "refresh_cos": float("nan"), "refreshed": False}
+SERVO_ENV_VAR = "MILES_GAIN_SERVO"
+_SERVO = float(os.environ.get(SERVO_ENV_VAR, "0"))
+SERVO_TARGET_ENV_VAR = "MILES_GAIN_SERVO_TARGET"
+_SERVO_TARGET = float(os.environ.get(SERVO_TARGET_ENV_VAR, "0"))
+assert _SERVO >= 0 and (_SERVO == 0 or _SERVO_TARGET > 0), f"{SERVO_ENV_VAR}={_SERVO} needs {SERVO_TARGET_ENV_VAR} > 0"
+_SERVO_SMOOTHING = 0.8  # decay of the gain's average over the steps that compute the penalty
+# The direction kept across steps, the training steps it has served, what the last computed gradient's cosine
+# with the direction before it was, and the smoothed gain.
+_kept: dict = {"direction": None, "age": 0, "refresh_cos": float("nan"), "refreshed": False, "gain": None}
 
 
 def _named_grads(model_chunks) -> list[tuple[str, torch.Tensor]]:
@@ -124,20 +136,30 @@ def project_out_penalty_gradient(model_chunks, penalty_grads: list[torch.Tensor]
     sums = torch.tensor(gain_penalty.phase_sums(), dtype=torch.float64, device=named[0][1].device)
     if torch.distributed.is_initialized():
         torch.distributed.all_reduce(sums)
+    gain_d2 = float(sums[0] / sums[1].clamp_min(1))
+    if _kept["refreshed"]:
+        previous = _kept["gain"]
+        _kept["gain"] = gain_d2 if previous is None else _SERVO_SMOOTHING * previous + (1 - _SERVO_SMOOTHING) * gain_d2
     projected = dot < 0 and penalty2 > 0
+    # in units of the policy gradient's norm, along the unit penalty direction
+    servo_push = min(_SERVO * max(_kept["gain"] / _SERVO_TARGET - 1, 0.0), 1.0) if _SERVO > 0 and penalty2 > 0 else 0.0
+    coefficient = servo_push * (policy2 / penalty2) ** 0.5 if servo_push > 0 else 0.0
     if projected:
-        coefficient = dot / penalty2
+        coefficient -= dot / penalty2
+    if coefficient != 0:
         for (_, grad), penalty in zip(named, penalty_grads, strict=True):
-            grad.sub_(penalty.to(grad.dtype), alpha=coefficient)
+            grad.add_(penalty.to(grad.dtype), alpha=coefficient)
     logger.info(
-        "gain projection rollout=%d cos=%.4f policy_norm=%.4e penalty_norm=%.4e removed_share=%.4e gain_d2=%.4e projected=%d refreshed=%d refresh_cos=%.4f",
+        "gain projection rollout=%d cos=%.4f policy_norm=%.4e penalty_norm=%.4e removed_share=%.4e gain_d2=%.4e projected=%d refreshed=%d refresh_cos=%.4f servo_push=%.4f gain_smoothed=%.4e",
         rollout_id,
         dot / max((penalty2 * policy2) ** 0.5, 1e-30),
         policy2**0.5,
         penalty2**0.5,
         dot * dot / max(penalty2 * policy2, 1e-30) if projected else 0.0,
-        float(sums[0] / sums[1].clamp_min(1)),
+        gain_d2,
         int(projected),
         int(_kept["refreshed"]),
         _kept["refresh_cos"],
+        servo_push,
+        _kept["gain"],
     )
