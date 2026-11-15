@@ -11,7 +11,7 @@ from miles.backends.training_utils.data.context_parallel import (
     slice_log_prob_with_cp,
 )
 from miles.backends.training_utils.data.sampling_mask import rollout_topk_candidate_ids
-from miles.backends.training_utils.loss.hub import gain_penalty
+from miles.backends.training_utils.loss.hub import gain_penalty, score_centering_kl_neutral
 from miles.backends.training_utils.loss.hub.logit_processors import _iter_response_chunks
 from miles.backends.training_utils.loss.hub.math_utils import compute_approx_kl
 from miles.backends.training_utils.loss.hub.score_centering import (
@@ -164,13 +164,18 @@ def score_centering_loss_function(
     advantages = torch.where(active, torch.cat(batch["advantages"]).detach(), 0.0)
     ids = _local_candidates(args, batch, "rollout_topk_token_ids", logits.device)
     head = _local_candidates(args, batch, "rollout_topk_log_probs", logits.device)
+    head_mask = (ids >= 0) & active.unsqueeze(-1)
+    # Experiment (LLMT-83): log, and optionally remove, the update's first-order push on the trainer-sampler KL.
+    advantages, kl_metrics = score_centering_kl_neutral.adjust(
+        advantages, selected[:, 0], selected[:, 1:], rollout, head, head_mask, active, sum_of_sample_mean
+    )
     token_loss, metrics = score_centering_loss(
         ScoreCenteringInputs(
             train_log_probs=selected[:, 0],
             train_head_log_probs=selected[:, 1:],
             rollout_log_probs=rollout,
             rollout_head_log_probs=head,
-            head_mask=(ids >= 0) & active.unsqueeze(-1),
+            head_mask=head_mask,
             advantages=advantages,
             mode=args.score_centering_is,
             tis_clip=args.score_centering_tis_clip,
@@ -180,7 +185,7 @@ def score_centering_loss_function(
     )
     # Experiment hooks (LLMT-83): the gain penalty's passes replace or extend the token loss as they do for
     # plain policy gradient, and the dump steps save the per-token tensors.
-    gain_metrics: dict[str, torch.Tensor] = {}
+    gain_metrics: dict[str, torch.Tensor] = dict(kl_metrics)
     if gain_penalty.enabled():
         token_loss, gain_metrics = gain_penalty.apply(batch, token_loss, selected[:, 0], active, rollout)
     if args.dump_details is not None and not gain_penalty.quiet():
