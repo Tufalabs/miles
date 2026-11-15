@@ -8,7 +8,9 @@ MILES_WEIGHT_SWAP is a comma-separated list of entries, as MILES_FREEZE_PARAMS (
 
 The base model is the run's `--ref-load` checkpoint. Everything else keeps the values of the checkpoint the run
 loaded. MILES_WEIGHT_SWAP_INVERT=1 inverts the choice: the named groups keep the checkpoint's values and
-everything else takes the base model's. The swap happens once, after the checkpoint is loaded and before
+everything else takes the base model's. MILES_WEIGHT_SWAP_BLEND=a puts base + a * (checkpoint - base) where the
+base values would go: 0 is the base model (the default), 1 the checkpoint, and values between or beyond walk
+along the checkpoint's change in that group. The swap happens once, after the checkpoint is loaded and before
 anything reads the weights; it is for probes at learning rate 0 that ask where in the weights a property of a
 checkpoint sits.
 """
@@ -31,6 +33,8 @@ _ENTRIES = tuple(p for p in os.environ.get(ENV_VAR, "").split(",") if p)
 _PATTERNS = tuple(p for p in _ENTRIES if not p.startswith(_ROWS_PREFIX))
 _QKV_PARTS = "".join(p[len(_ROWS_PREFIX) :] for p in _ENTRIES if p.startswith(_ROWS_PREFIX))
 _INVERT = os.environ.get(INVERT_ENV_VAR, "") == "1"
+BLEND_ENV_VAR = "MILES_WEIGHT_SWAP_BLEND"
+_BLEND = float(os.environ.get(BLEND_ENV_VAR, "0"))
 
 
 def enabled() -> bool:
@@ -90,6 +94,8 @@ def swap_in_base_weights(args, model_chunks) -> None:
             elements[0] += param.numel()
             moved2 += float((checkpoint_value.float() - param.float()).square().sum())
             base2 += float(param.float().square().sum())
+            if _BLEND != 0:
+                param.add_(checkpoint_value - param, alpha=_BLEND)
         elif mask is False:
             elements[1] += param.numel()
             param.copy_(checkpoint_value)
@@ -99,11 +105,14 @@ def swap_in_base_weights(args, model_chunks) -> None:
             elements[1] += int((~mask).sum()) * row_elements
             moved2 += float((checkpoint_value[mask].float() - param[mask].float()).square().sum())
             base2 += float(param[mask].float().square().sum())
+            if _BLEND != 0:
+                param[mask] = param[mask] + _BLEND * (checkpoint_value[mask] - param[mask])
             param[~mask] = checkpoint_value[~mask]
     logger.info(
-        "weight swap: entries=%s invert=%d base elements=%.4e checkpoint elements=%.4e |checkpoint - base| / |base| over the base part=%.4e (this rank)",
+        "weight swap: entries=%s invert=%d blend=%g base elements=%.4e checkpoint elements=%.4e |checkpoint - base| / |base| over the base part=%.4e (this rank)",
         _ENTRIES,
         int(_INVERT),
+        _BLEND,
         elements[0],
         elements[1],
         (moved2 / max(base2, 1e-30)) ** 0.5,
