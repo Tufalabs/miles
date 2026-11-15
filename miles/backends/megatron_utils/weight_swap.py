@@ -10,7 +10,11 @@ The base model is the run's `--ref-load` checkpoint. Everything else keeps the v
 loaded. MILES_WEIGHT_SWAP_INVERT=1 inverts the choice: the named groups keep the checkpoint's values and
 everything else takes the base model's. MILES_WEIGHT_SWAP_BLEND=a puts base + a * (checkpoint - base) where the
 base values would go: 0 is the base model (the default), 1 the checkpoint, and values between or beyond walk
-along the checkpoint's change in that group. The swap happens once, after the checkpoint is loaded and before
+along the checkpoint's change in that group. The model's parameters may be bf16 (the optimizer keeps the fp32
+copies), where base + a * (checkpoint - base) rounds back to a bf16 value; MILES_WEIGHT_SWAP_BLEND_MODE=random
+gives each element the checkpoint's value with probability a (0 < a < 1) instead, which has the linear blend as
+its mean. The swap changes the model's parameters, not the optimizer's copies: it holds for the first training
+step's forward and for the weights sent to the sampler before it. The swap happens once, after the checkpoint is loaded and before
 anything reads the weights; it is for probes at learning rate 0 that ask where in the weights a property of a
 checkpoint sits.
 """
@@ -35,6 +39,24 @@ _QKV_PARTS = "".join(p[len(_ROWS_PREFIX) :] for p in _ENTRIES if p.startswith(_R
 _INVERT = os.environ.get(INVERT_ENV_VAR, "") == "1"
 BLEND_ENV_VAR = "MILES_WEIGHT_SWAP_BLEND"
 _BLEND = float(os.environ.get(BLEND_ENV_VAR, "0"))
+BLEND_MODE_ENV_VAR = "MILES_WEIGHT_SWAP_BLEND_MODE"
+_BLEND_RANDOM = os.environ.get(BLEND_MODE_ENV_VAR, "linear") == "random"
+assert not _BLEND_RANDOM or 0 < _BLEND < 1, f"{BLEND_MODE_ENV_VAR}=random needs 0 < {BLEND_ENV_VAR} < 1"
+
+
+def _blend(base: torch.Tensor, checkpoint_value: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
+    if _BLEND_RANDOM:
+        take = torch.rand(base.shape, device=base.device, generator=generator) < _BLEND
+        return torch.where(take, checkpoint_value, base)
+    return base + _BLEND * (checkpoint_value - base)
+
+
+def _steps_apart(base: torch.Tensor, checkpoint_value: torch.Tensor) -> tuple[int, int]:
+    """Elements that differ, and those of them less than 1.5 bf16 steps apart (8 significant bits)."""
+    difference = (checkpoint_value.float() - base.float()).abs()
+    changed = difference > 0
+    step = torch.exp2(torch.floor(torch.log2(base.float().abs().clamp_min(1e-30))) - 7)
+    return int(changed.sum()), int((changed & (difference < 1.5 * step)).sum())
 
 
 def enabled() -> bool:
@@ -87,15 +109,18 @@ def swap_in_base_weights(args, model_chunks) -> None:
     with args.backend.mutable(), inplace_modify_args(args.backend, dict(load=args.ref_load, no_load_optim=True, no_load_rng=True, finetune=True, ckpt_step=None)):
         load_checkpoint(model_chunks, None, None, checkpointing_context={}, args=args, skip_load_to_model_and_opt=False)
     # elements and squared norms: [from the base, kept from the checkpoint], and the change the base part undoes
-    elements, moved2, base2 = [0, 0], 0.0, 0.0
+    elements, moved2, base2, changed, one_step = [0, 0], 0.0, 0.0, 0, 0
+    generator = torch.Generator(device=params[0][1].device).manual_seed(1234)
     for (_name, param), checkpoint_value in zip(params, loaded, strict=True):
         mask = masks[id(param)]
         if mask is True:
             elements[0] += param.numel()
             moved2 += float((checkpoint_value.float() - param.float()).square().sum())
             base2 += float(param.float().square().sum())
+            counts = _steps_apart(param, checkpoint_value)
+            changed, one_step = changed + counts[0], one_step + counts[1]
             if _BLEND != 0:
-                param.add_(checkpoint_value - param, alpha=_BLEND)
+                param.copy_(_blend(param, checkpoint_value, generator))
         elif mask is False:
             elements[1] += param.numel()
             param.copy_(checkpoint_value)
@@ -106,15 +131,20 @@ def swap_in_base_weights(args, model_chunks) -> None:
             moved2 += float((checkpoint_value[mask].float() - param[mask].float()).square().sum())
             base2 += float(param[mask].float().square().sum())
             if _BLEND != 0:
-                param[mask] = param[mask] + _BLEND * (checkpoint_value[mask] - param[mask])
+                param[mask] = _blend(param[mask], checkpoint_value[mask], generator)
             param[~mask] = checkpoint_value[~mask]
     logger.info(
-        "weight swap: entries=%s invert=%d blend=%g base elements=%.4e checkpoint elements=%.4e |checkpoint - base| / |base| over the base part=%.4e (this rank)",
+        "weight swap: entries=%s invert=%d blend=%g%s base elements=%.4e checkpoint elements=%.4e |checkpoint - base| / |base| over the base part=%.4e"
+        " dtypes=%s differing elements of whole tensors=%.4e, under 1.5 bf16 steps apart=%.4e (this rank)",
         _ENTRIES,
         int(_INVERT),
         _BLEND,
+        " random" if _BLEND_RANDOM else "",
         elements[0],
         elements[1],
         (moved2 / max(base2, 1e-30)) ** 0.5,
+        sorted({str(param.dtype) for _, param in params}),
+        changed,
+        one_step,
     )
     assert elements[0] > 0 and elements[1] > 0, f"{ENV_VAR}={_ENTRIES} names nothing, or everything"
