@@ -10,7 +10,7 @@ from miles.backends.training_utils.data.context_parallel import (
     get_sum_of_sample_mean,
 )
 from miles.backends.training_utils.data.sampling_mask import get_rollout_sampling_masks
-from miles.backends.training_utils.loss.hub import gain_penalty, rollout_kl
+from miles.backends.training_utils.loss.hub import gain_penalty, rollout_kl, sampled_token_centering
 from miles.backends.training_utils.loss.hub.corrections import vanilla_tis_function
 from miles.backends.training_utils.loss.hub.logit_processors import get_log_probs_and_entropy, get_values
 from miles.backends.training_utils.loss.hub.math_utils import (
@@ -221,6 +221,13 @@ def policy_loss_function(
             active_tokens,
             torch.cat(rollout_old_log_probs, dim=0) if rollout_old_log_probs else None,
         )
+
+    if sampled_token_centering.enabled():
+        assert rollout_old_log_probs is not None, "MILES_SAMPLED_TOKEN_CENTERING needs rollout log-probs in the batch"
+        pg_loss, stc_metrics = sampled_token_centering.apply(
+            pg_loss, log_probs, torch.cat(rollout_old_log_probs, dim=0), active_tokens
+        )
+        gain_penalty_metrics = {**gain_penalty_metrics, **stc_metrics}
 
     if rollout_kl.enabled() and not gain_penalty.quiet():
         assert rollout_old_log_probs is not None, "MILES_ROLLOUT_KL needs rollout log-probs in the batch"
