@@ -74,6 +74,7 @@ from miles.utils.workers.rpc.common.wire_types import Pickled
 from ...utils.profile_utils import TrainProfiler
 from ...utils.tensor_backper import TensorBackuper
 from ..training_utils.parallel import get_parallel_state
+from . import weight_swap
 from .checkpoint import load_checkpoint
 from .ft.checkpoint_transfer import recv_ckpt
 from .ft.checkpoint_transfer import send_ckpt as _send_ckpt
@@ -442,6 +443,8 @@ class MegatronTrainRayActor(TrainRayActor):
             )
 
         if self.role != "critic":
+            if weight_swap.enabled():
+                weight_swap.swap_in_base_weights(self.args, self.model)
             self._load_auxiliary_checkpoints()
             self._switch_model("actor")
 
