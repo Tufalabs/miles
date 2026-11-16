@@ -11,8 +11,10 @@ to them for its forward passes. Each training step:
   3. the policy pass runs as usual, through the adapted weights; its gradient goes to the model's own values
      as for any other weight (MILES_SAMPLER_ADAPTER_FREEZE=1 zeroes it for the group, which then stays where
      the run started on the sampler's side);
-  4. the group goes back to the sampler's values and the offset takes its step, offset <- offset - lr *
-     gradient (MILES_SAMPLER_ADAPTER_LR, default 0.02).
+  4. the group goes back to the sampler's values and the offset takes its step, offset <- (1 - lr * wd) *
+     offset - lr * gradient (MILES_SAMPLER_ADAPTER_LR, default 0.02; MILES_SAMPLER_ADAPTER_WD, default 0).
+     The weight decay gives the offset a memory of 1 / (lr * wd) steps: it holds what the last steps'
+     divergence supports and forgets the rest, so that it does not accumulate a change of its own.
 
 So the sampler never receives the offset and the policy loss never trains it. The offset is kept in fp32; the
 model's bf16 values during the passes are the rounded sum of the sampler's bf16 values and the offset. It is
@@ -38,6 +40,9 @@ _ENTRIES = tuple(p for p in os.environ.get(ENV_VAR, "").split(",") if p)
 _PATTERNS = tuple(p for p in _ENTRIES if not p.startswith(_ROWS_PREFIX))
 _QKV_PARTS = "".join(p[len(_ROWS_PREFIX) :] for p in _ENTRIES if p.startswith(_ROWS_PREFIX))
 _LR = float(os.environ.get(LR_ENV_VAR, "") or 0.02)
+WD_ENV_VAR = "MILES_SAMPLER_ADAPTER_WD"
+_WD = float(os.environ.get(WD_ENV_VAR, "") or 0.0)
+assert 0 <= _LR * _WD < 1, f"{WD_ENV_VAR}={_WD} with {LR_ENV_VAR}={_LR}: lr * wd must be in [0, 1)"
 FREEZE_ENV_VAR = "MILES_SAMPLER_ADAPTER_FREEZE"
 _FREEZE = os.environ.get(FREEZE_ENV_VAR, "") == "1"
 
@@ -83,11 +88,12 @@ def _collect(model_chunks) -> None:
         entry["offset"] = torch.zeros_like(entry["param"].data[entry["rows"]], dtype=torch.float32)
         elements += entry["offset"].numel()
     logger.info(
-        "sampler adapter: entries=%s tensors=%d elements=%.4e lr=%g freeze=%d (this rank)",
+        "sampler adapter: entries=%s tensors=%d elements=%.4e lr=%g wd=%g freeze=%d (this rank)",
         _ENTRIES,
         len(_state),
         elements,
         _LR,
+        _WD,
         int(_FREEZE),
     )
 
@@ -141,7 +147,7 @@ def finish(rollout_id: int) -> None:
             grad[entry["rows"]] = 0
         gradient = entry.pop("gradient")
         gradient2 += float(gradient.square().sum())
-        entry["offset"].add_(gradient, alpha=-_LR)
+        entry["offset"].mul_(1 - _LR * _WD).add_(gradient, alpha=-_LR)
         offset2 += float(entry["offset"].square().sum())
     _write(adapted=False)
     logger.info(
