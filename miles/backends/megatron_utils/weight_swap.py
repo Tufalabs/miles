@@ -100,8 +100,10 @@ def _base_masks(model_chunks) -> dict[int, torch.Tensor | bool]:
 
 
 @torch.no_grad()
-def swap_in_base_weights(args, model_chunks) -> None:
-    """Replace the groups MILES_WEIGHT_SWAP names by the values of the `--ref-load` checkpoint."""
+def swap_in_base_weights(args, model_chunks, optimizer=None) -> None:
+    """Replace the groups MILES_WEIGHT_SWAP names by the values of the `--ref-load` checkpoint. With an
+    `optimizer`, its master weights take the swapped values too; otherwise the first optimizer step writes the
+    checkpoint's weights back over the model's."""
     assert args.ref_load, f"{ENV_VAR} needs --ref-load, the base model's checkpoint"
     masks = _base_masks(model_chunks)
     params = [(name, param) for chunk in model_chunks for name, param in chunk.named_parameters()]
@@ -148,3 +150,5 @@ def swap_in_base_weights(args, model_chunks) -> None:
         one_step,
     )
     assert elements[0] > 0 and elements[1] > 0, f"{ENV_VAR}={_ENTRIES} names nothing, or everything"
+    if optimizer is not None and (args.backend.fp16 or args.backend.bf16):
+        optimizer.reload_model_params()

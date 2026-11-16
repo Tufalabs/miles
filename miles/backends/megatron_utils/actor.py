@@ -444,7 +444,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if self.role != "critic":
             if weight_swap.enabled():
-                weight_swap.swap_in_base_weights(self.args, self.model)
+                weight_swap.swap_in_base_weights(self.args, self.model, optimizer=self.optimizer)
             self._load_auxiliary_checkpoints()
             self._switch_model("actor")
 
