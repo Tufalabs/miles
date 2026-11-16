@@ -86,6 +86,30 @@ def _candidate_log_probs(args: Namespace, batch: RolloutBatch, logits: torch.Ten
     return result
 
 
+_SCALE_CANDIDATES = 8
+
+
+def _logit_scale(
+    train_head: torch.Tensor, rollout_head: torch.Tensor, head_mask: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per prefix, over the sampler's top candidates: the spread (standard deviation) of the trainer's
+    log-probs, which keeps its gradient, and of log p - log q, detached. Zero where under two candidates."""
+    ranked = rollout_head.detach().float().masked_fill(~head_mask, -torch.inf)
+    top = ranked.topk(min(_SCALE_CANDIDATES, ranked.shape[1]), dim=1)
+    trainer = train_head.float().gather(1, top.indices)
+    valid = torch.isfinite(top.values) & torch.isfinite(trainer.detach())
+    count = valid.sum(1, keepdim=True).clamp_min(2)
+
+    def spread(values: torch.Tensor) -> torch.Tensor:
+        values = torch.where(valid, values, 0.0)
+        mean = values.sum(1, keepdim=True) / count
+        variance = (torch.where(valid, values - mean, 0.0) ** 2).sum(1) / (count.squeeze(1) - 1)
+        return torch.where(valid.sum(1) >= 2, variance.clamp_min(1e-12).sqrt(), 0.0)
+
+    error = torch.where(valid, trainer.detach() - top.values, 0.0)
+    return spread(trainer), spread(error)
+
+
 def _local_candidates(args: Namespace, batch: RolloutBatch, key: str, device: torch.device) -> torch.Tensor:
     values = []
     for i, (total, response) in enumerate(zip(batch["total_lengths"], batch["response_lengths"], strict=True)):
@@ -185,8 +209,17 @@ def score_centering_loss_function(
     )
     # Experiment hooks (LLMT-83): the gain penalty's passes replace or extend the token loss as they do for
     # plain policy gradient, and the dump steps save the per-token tensors.
+    # The logit scale and the trainer-sampler logit error per prefix; logged at every step.
+    scale, logit_error = _logit_scale(selected[:, 1:], head, head_mask)
+    scale = torch.where(active, scale, 0.0)
     gain_metrics: dict[str, torch.Tensor] = dict(kl_metrics)
-    if gain_penalty.enabled():
+    gain_metrics["sc_logit_scale"] = scale.detach()
+    gain_metrics["sc_logit_error"] = torch.where(active, logit_error, 0.0)
+    if gain_penalty.enabled() and gain_penalty.scale_target():
+        # the projection's penalty phase: the loss is the logit scale alone
+        token_loss = 0.0 * token_loss + scale.to(token_loss.dtype)
+        gain_penalty.add_phase(float(scale.detach().sum()), float(active.sum()))
+    elif gain_penalty.enabled():
         token_loss, gain_metrics = gain_penalty.apply(batch, token_loss, selected[:, 0], active, rollout)
     if args.dump_details is not None and not gain_penalty.quiet():
         maybe_dump_score_centering_debug(

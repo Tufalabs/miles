@@ -23,7 +23,10 @@ first computes the penalty's own gradient (the penalty phase: both passes with t
 the policy gradient as usual, and removes from the policy gradient its component along the penalty's gradient
 when that component would raise the penalty (megatron_utils/gain_projection.py). With
 MILES_GAIN_PROJECTION_TARGET=rollout the penalty is huber(log p_plain - log p_rollout) on the sampled tokens,
-the rollout engine's log-probs taken from the batch: one plain forward, no emulation.
+the rollout engine's log-probs taken from the batch: one plain forward, no emulation. With
+MILES_GAIN_PROJECTION_TARGET=scale (score-centering loss only) the penalty is the logit scale: per prefix, the
+spread of the trainer's log-probs over the sampler's top candidates (score_centering_loss.py); one plain
+forward. The projection and the servo then act on the growth of the logit scale.
 """
 
 import contextlib
@@ -42,8 +45,8 @@ _PROJECTION = os.environ.get(PROJECTION_ENV_VAR, "") == "1"
 # constant: one forward, no emulation needed).
 TARGET_ENV_VAR = "MILES_GAIN_PROJECTION_TARGET"
 _TARGET = os.environ.get(TARGET_ENV_VAR, "emulation")
-assert _TARGET in ("emulation", "rollout"), f"{TARGET_ENV_VAR}={_TARGET!r}: expected emulation or rollout"
-assert _TARGET == "emulation" or _PROJECTION, f"{TARGET_ENV_VAR}=rollout is for {PROJECTION_ENV_VAR}=1"
+assert _TARGET in ("emulation", "rollout", "scale"), f"{TARGET_ENV_VAR}={_TARGET!r}: expected emulation, rollout or scale"
+assert _TARGET == "emulation" or _PROJECTION, f"{TARGET_ENV_VAR}={_TARGET} is for {PROJECTION_ENV_VAR}=1"
 assert not (_PROJECTION and _COEFFICIENT > 0), f"set {ENV_VAR} or {PROJECTION_ENV_VAR}, not both"
 _ROUNDED_LOG_PROBS_KEY = "gain_penalty_rounded_log_probs"
 _PLAIN_LOG_PROBS_KEY = "gain_penalty_plain_log_probs"
@@ -89,6 +92,17 @@ def penalty_phase():
 def phase_sums() -> tuple[float, float]:
     """Sum of squared log-prob differences and supervised tokens of the last penalty phase, on this rank."""
     return _phase_sums[0], _phase_sums[1]
+
+
+def scale_target() -> bool:
+    """The projection's penalty is the logit scale, computed by the score-centering loss."""
+    return _TARGET == "scale"
+
+
+def add_phase(total: float, count: float) -> None:
+    """Add a penalty phase's sum and token count for a penalty computed outside this module."""
+    _phase_sums[0] += total
+    _phase_sums[1] += count
 
 
 def needs_rounded_pass() -> bool:
