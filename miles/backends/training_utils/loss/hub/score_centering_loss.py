@@ -222,7 +222,10 @@ def score_centering_loss_function(
     # Experiment (LLMT-83): a pull toward the sampler's returned candidates, part of the policy loss.
     head_kl = score_centering_head_kl.divergence(selected[:, 1:], head, head_mask)
     gain_metrics["sc_head_kl"] = head_kl.detach()
-    if score_centering_head_kl.coefficient():
+    divergence_phase = score_centering_head_kl.in_divergence_phase()
+    if divergence_phase:
+        token_loss = 0.0 * token_loss + head_kl.to(token_loss.dtype)
+    elif score_centering_head_kl.coefficient():
         policy_share = 0.0 if score_centering_head_kl.only() else 1.0
         token_loss = policy_share * token_loss + score_centering_head_kl.coefficient() * head_kl.to(token_loss.dtype)
     if gain_penalty.enabled() and gain_penalty.scale_target():
@@ -231,7 +234,7 @@ def score_centering_loss_function(
         gain_penalty.add_phase(float(scale.detach().sum()), float(active.sum()))
     elif gain_penalty.enabled():
         token_loss, gain_metrics = gain_penalty.apply(batch, token_loss, selected[:, 0], active, rollout)
-    if args.dump_details is not None and not gain_penalty.quiet():
+    if args.dump_details is not None and not gain_penalty.quiet() and not divergence_phase:
         maybe_dump_score_centering_debug(
             args,
             {

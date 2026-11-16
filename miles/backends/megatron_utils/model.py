@@ -86,6 +86,7 @@ def _has_loadable_ckpt(load_dir: str | None) -> bool:
 from .fp32_param_utils import enforce_marked_param_dtypes
 from .emulation_divergence import maybe_save_trace
 from .freeze_params import maybe_zero_frozen_grads
+from . import sampler_adapter
 from .gain_projection import penalty_gradient, project_out_penalty_gradient
 from .grad_sketch import maybe_save_grad_sketch
 from .sampler_emulation import maybe_install_sampler_emulation
@@ -637,6 +638,16 @@ def train_one_step(
         custom_before_train_step_hook(fn_args, rollout_id, step_id, model, optimizer, opt_param_scheduler)
 
     with training_rollout_scope(rollout_id):
+        if sampler_adapter.enabled():
+            sampler_adapter.measure(
+                lambda count: run_forward_backward_pass(
+                    args, dumper_phase_util, data_iterator, model, count, num_rollouts
+                ),
+                data_iterator,
+                model,
+                lambda: _zero_grads(model, optimizer, disable_optimizer),
+                num_microbatches,
+            )
         gain_penalty_grads = None
         if gain_penalty.projection_enabled():
             gain_penalty_grads = penalty_gradient(
@@ -653,6 +664,8 @@ def train_one_step(
         )
     if gain_penalty_grads is not None:
         project_out_penalty_gradient(model, gain_penalty_grads, rollout_id)
+    if sampler_adapter.enabled():
+        sampler_adapter.finish(rollout_id)
     maybe_zero_frozen_grads(model)
     maybe_save_grad_sketch(model, args.dump_details, rollout_id, step_id)
     maybe_save_trace(args.dump_details, rollout_id)

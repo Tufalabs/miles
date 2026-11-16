@@ -16,8 +16,12 @@ divergence is logged per token as `sc_head_kl` whether or not the term is on.
 MILES_SC_HEAD_KL_ONLY=1 drops the policy loss and trains on the divergence alone: on replayed rollouts of fixed
 weights it measures how much of the trainer-sampler mismatch a trainer-side change can learn to predict (the
 divergence logged at a step is that of a batch the trainer has not yet been trained on).
+
+`divergence_phase()` marks passes whose loss is the forward or reverse divergence alone whatever the settings
+above: the sampler adapter's pass (megatron_utils/sampler_adapter.py).
 """
 
+import contextlib
 import os
 
 import torch
@@ -41,6 +45,30 @@ def coefficient() -> float:
 
 def only() -> bool:
     return _ONLY
+
+
+_phase = {"active": False, "uses": 0}
+
+
+@contextlib.contextmanager
+def divergence_phase():
+    """Passes whose loss is the divergence alone, with coefficient 1."""
+    _phase["active"], _phase["uses"] = True, 0
+    try:
+        yield
+    finally:
+        _phase["active"] = False
+
+
+def in_divergence_phase() -> bool:
+    """Called by the loss that honours the phase; counts the calls so that the phase's owner can check."""
+    if _phase["active"]:
+        _phase["uses"] += 1
+    return _phase["active"]
+
+
+def phase_uses() -> int:
+    return _phase["uses"]
 
 
 def divergence(
