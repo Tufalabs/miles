@@ -17,13 +17,18 @@ to them for its forward passes. Each training step:
      divergence supports and forgets the rest, so that it does not accumulate a change of its own.
 
 So the sampler never receives the offset and the policy loss never trains it. The offset is kept in fp32; the
-model's bf16 values during the passes are the rounded sum of the sampler's bf16 values and the offset. It is
-not saved: a resumed run starts it from zero. It doubles the training passes of a step.
+model's bf16 values during the passes are the rounded sum of the sampler's bf16 values and the offset. It
+doubles the training passes of a step.
+
+The offset is saved next to each checkpoint, one file per rank
+(<checkpoints>/sampler_adapter_iter_<step>/rank<rank>.pt), and a run that loads that checkpoint starts from it.
+A checkpoint without such files starts the offset from zero.
 """
 
 import logging
 import os
 from collections.abc import Callable, Sequence
+from pathlib import Path
 
 import torch
 
@@ -50,6 +55,8 @@ _FREEZE = os.environ.get(FREEZE_ENV_VAR, "") == "1"
 # values of those rows, the offset (fp32) and the step's gradient of the divergence on them.
 _state: list[dict] = []
 _ready = False
+# The checkpoint the run loaded (its directory and step), whose saved offsets the first step restores.
+_loaded_checkpoint: tuple[str, int] | None = None
 
 
 def enabled() -> bool:
@@ -87,6 +94,7 @@ def _collect(model_chunks) -> None:
     for entry in _state:
         entry["offset"] = torch.zeros_like(entry["param"].data[entry["rows"]], dtype=torch.float32)
         elements += entry["offset"].numel()
+    _restore_offsets()
     logger.info(
         "sampler adapter: entries=%s tensors=%d elements=%.4e lr=%g wd=%g freeze=%d (this rank)",
         _ENTRIES,
@@ -96,6 +104,51 @@ def _collect(model_chunks) -> None:
         _WD,
         int(_FREEZE),
     )
+
+
+def _offsets_file(checkpoints_dir: str, iteration: int) -> Path:
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    return Path(checkpoints_dir) / f"sampler_adapter_iter_{iteration:07d}" / f"rank{rank:05d}.pt"
+
+
+def loaded_checkpoint(checkpoints_dir: str, iteration: int) -> None:
+    """Called when the run has loaded the checkpoint of `iteration`: the offsets saved with it are restored when
+    the group is collected, at the first training step."""
+    global _loaded_checkpoint
+    _loaded_checkpoint = (checkpoints_dir, iteration)
+
+
+@torch.no_grad()
+def _restore_offsets() -> None:
+    if _loaded_checkpoint is None:
+        return
+    path = _offsets_file(*_loaded_checkpoint)
+    if not path.is_file():
+        logger.info("sampler adapter: no saved offsets at %s, starting from zero (this rank)", path)
+        return
+    saved = torch.load(path, map_location="cpu", weights_only=True)
+    names = [entry["name"] for entry in _state]
+    assert saved["names"] == names, f"{path} holds offsets of other parameters than {ENV_VAR}={_ENTRIES} names"
+    norm2 = 0.0
+    for entry, offset in zip(_state, saved["offsets"], strict=True):
+        assert offset.shape == entry["offset"].shape, f"{path}: {entry['name']} has shape {tuple(offset.shape)}"
+        entry["offset"].copy_(offset)
+        norm2 += float(entry["offset"].square().sum())
+    logger.info("sampler adapter: restored offsets from %s, offset_norm=%.4e (this rank)", path, norm2**0.5)
+
+
+@torch.no_grad()
+def save_offsets(checkpoints_dir: str, iteration: int) -> None:
+    """Next to the checkpoint of `iteration`. Nothing before the first training step has collected the group."""
+    if not _ready:
+        return
+    path = _offsets_file(checkpoints_dir, iteration)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    partial = path.with_suffix(".partial")
+    names = [entry["name"] for entry in _state]
+    torch.save({"names": names, "offsets": [entry["offset"].cpu() for entry in _state]}, partial)
+    os.replace(partial, path)
+    logger.info("sampler adapter: saved offsets to %s (this rank)", path)
 
 
 @torch.no_grad()

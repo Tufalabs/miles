@@ -1033,6 +1033,8 @@ def save(
             checkpointing_context=checkpointing_context,
             non_persistent_ckpt=non_persistent_ckpt,
         )
+    if sampler_adapter.enabled() and not non_persistent_ckpt and args.backend.save is not None:
+        sampler_adapter.save_offsets(args.backend.save, iteration)
 
     if hashes is not None:
         save_model_hashes(args, model, iteration, hashes)
@@ -1125,6 +1127,8 @@ def load_model_state(
                 args=args,
                 skip_load_to_model_and_opt=False,
             )
+        if sampler_adapter.enabled() and role == "actor" and load_dir is not None and iteration > 0:
+            sampler_adapter.loaded_checkpoint(load_dir, iteration)
         # MCore loads scheduler state with the optimizer state, and its load_state_dict
         # replays the saved step count whatever use_checkpoint_opt_param_scheduler says;
         # that flag only picks which scheduler settings win. A release checkpoint returns
