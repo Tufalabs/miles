@@ -11,7 +11,11 @@ from miles.backends.training_utils.data.context_parallel import (
     slice_log_prob_with_cp,
 )
 from miles.backends.training_utils.data.sampling_mask import rollout_topk_candidate_ids
-from miles.backends.training_utils.loss.hub import gain_penalty, score_centering_kl_neutral
+from miles.backends.training_utils.loss.hub import (
+    gain_penalty,
+    score_centering_head_kl,
+    score_centering_kl_neutral,
+)
 from miles.backends.training_utils.loss.hub.logit_processors import _iter_response_chunks
 from miles.backends.training_utils.loss.hub.math_utils import compute_approx_kl
 from miles.backends.training_utils.loss.hub.score_centering import (
@@ -215,6 +219,11 @@ def score_centering_loss_function(
     gain_metrics: dict[str, torch.Tensor] = dict(kl_metrics)
     gain_metrics["sc_logit_scale"] = scale.detach()
     gain_metrics["sc_logit_error"] = torch.where(active, logit_error, 0.0)
+    # Experiment (LLMT-83): a pull toward the sampler's returned candidates, part of the policy loss.
+    head_kl = score_centering_head_kl.divergence(selected[:, 1:], head, head_mask)
+    gain_metrics["sc_head_kl"] = head_kl.detach()
+    if score_centering_head_kl.coefficient():
+        token_loss = token_loss + score_centering_head_kl.coefficient() * head_kl.to(token_loss.dtype)
     if gain_penalty.enabled() and gain_penalty.scale_target():
         # the projection's penalty phase: the loss is the logit scale alone
         token_loss = 0.0 * token_loss + scale.to(token_loss.dtype)
