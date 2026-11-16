@@ -6,6 +6,11 @@ have a negative dot product, a step along the policy gradient would raise the pe
 policy gradient then loses that component: g <- g - (g . p / p . p) p. Nothing is done when the dot product is
 positive. The penalty itself is never added to the loss.
 
+One-sided removal is a rectifier: of a gradient that is mostly batch noise it keeps the noise that lowers the
+penalty and drops the noise that raises it, a net push down the penalty of about 0.4 standard deviations of
+the component per step. MILES_GAIN_PROJECTION_TWO_SIDED=1 removes the component whatever its sign, which
+pushes nowhere on average: the step then never moves the penalty to first order.
+
 The penalty's gradient costs three passes, and its direction changes little from batch to batch and from step
 to step, so it can be kept across steps: MILES_GAIN_PROJECTION_EVERY=N computes it on every N-th training step
 and projects the steps between off the kept direction. MILES_GAIN_PROJECTION_EMA=b makes the kept direction an
@@ -34,6 +39,8 @@ logger = logging.getLogger(__name__)
 FRACTION_ENV_VAR = "MILES_GAIN_PROJECTION_FRACTION"
 _FRACTION = float(os.environ.get(FRACTION_ENV_VAR, "1"))
 assert 0 < _FRACTION <= 1, f"{FRACTION_ENV_VAR}={_FRACTION}: expected a share in (0, 1]"
+TWO_SIDED_ENV_VAR = "MILES_GAIN_PROJECTION_TWO_SIDED"
+_TWO_SIDED = os.environ.get(TWO_SIDED_ENV_VAR, "") == "1"
 EVERY_ENV_VAR = "MILES_GAIN_PROJECTION_EVERY"
 _EVERY = int(os.environ.get(EVERY_ENV_VAR, "1"))
 assert _EVERY >= 1, f"{EVERY_ENV_VAR}={_EVERY}: expected a number of steps, at least 1"
@@ -144,7 +151,7 @@ def project_out_penalty_gradient(model_chunks, penalty_grads: list[torch.Tensor]
     if _kept["refreshed"]:
         previous = _kept["gain"]
         _kept["gain"] = gain_d2 if previous is None else _SERVO_SMOOTHING * previous + (1 - _SERVO_SMOOTHING) * gain_d2
-    projected = dot < 0 and penalty2 > 0 and not _SERVO_ONLY
+    projected = (dot < 0 or _TWO_SIDED) and penalty2 > 0 and not _SERVO_ONLY
     # in units of the policy gradient's norm, along the unit penalty direction
     servo_push = min(_SERVO * max(_kept["gain"] / _SERVO_TARGET - 1, 0.0), 1.0) if _SERVO > 0 and penalty2 > 0 else 0.0
     coefficient = servo_push * (policy2 / penalty2) ** 0.5 if servo_push > 0 else 0.0
