@@ -1,5 +1,6 @@
 """Integrate score centering with response alignment and Miles loss reduction."""
 
+import os
 from argparse import Namespace
 from collections.abc import Callable
 
@@ -26,6 +27,11 @@ from miles.backends.training_utils.loss.hub.score_centering import (
 from miles.backends.training_utils.metrics.debug_dump import maybe_dump_score_centering_debug
 from miles.backends.training_utils.parallel import get_parallel_state
 from miles.utils.types import RolloutBatch
+
+# Experiment (LLMT-83): MILES_SC_PLAIN_PG=1 replaces the centered loss by plain REINFORCE, -A log p(a), computed
+# here so that the terms built on the sampler's returned candidates (the head divergence, the sampler adapter)
+# can run with a policy gradient that is not centered.
+_PLAIN_PG = os.environ.get("MILES_SC_PLAIN_PG", "") == "1"
 
 
 def _candidate_log_probs(args: Namespace, batch: RolloutBatch, logits: torch.Tensor) -> dict[str, list[torch.Tensor]]:
@@ -211,6 +217,8 @@ def score_centering_loss_function(
             mis_high=args.score_centering_mis_high,
         ),
     )
+    if _PLAIN_PG:
+        token_loss = -(advantages * torch.where(active, selected[:, 0], 0.0)).to(token_loss.dtype)
     # Experiment hooks (LLMT-83): the gain penalty's passes replace or extend the token loss as they do for
     # plain policy gradient, and the dump steps save the per-token tensors.
     # The logit scale and the trainer-sampler logit error per prefix; logged at every step.
