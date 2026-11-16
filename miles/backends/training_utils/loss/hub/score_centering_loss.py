@@ -223,7 +223,8 @@ def score_centering_loss_function(
     head_kl = score_centering_head_kl.divergence(selected[:, 1:], head, head_mask)
     gain_metrics["sc_head_kl"] = head_kl.detach()
     if score_centering_head_kl.coefficient():
-        token_loss = token_loss + score_centering_head_kl.coefficient() * head_kl.to(token_loss.dtype)
+        policy_share = 0.0 if score_centering_head_kl.only() else 1.0
+        token_loss = policy_share * token_loss + score_centering_head_kl.coefficient() * head_kl.to(token_loss.dtype)
     if gain_penalty.enabled() and gain_penalty.scale_target():
         # the projection's penalty phase: the loss is the logit scale alone
         token_loss = 0.0 * token_loss + scale.to(token_loss.dtype)

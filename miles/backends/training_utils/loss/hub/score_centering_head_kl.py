@@ -12,6 +12,10 @@ candidates the sampler returned, with q held fixed. MILES_SC_HEAD_KL_KIND select
 
 Both distributions are renormalized over the valid candidates (the mass outside them is under 0.1%). The
 divergence is logged per token as `sc_head_kl` whether or not the term is on.
+
+MILES_SC_HEAD_KL_ONLY=1 drops the policy loss and trains on the divergence alone: on replayed rollouts of fixed
+weights it measures how much of the trainer-sampler mismatch a trainer-side change can learn to predict (the
+divergence logged at a step is that of a batch the trainer has not yet been trained on).
 """
 
 import os
@@ -23,6 +27,9 @@ KIND_ENV_VAR = "MILES_SC_HEAD_KL_KIND"
 _COEFFICIENT = float(os.environ.get(ENV_VAR, "") or 0.0)
 _KIND = os.environ.get(KIND_ENV_VAR, "") or "forward"
 assert _KIND in ("forward", "reverse"), f"{KIND_ENV_VAR}={_KIND!r}: expected forward or reverse"
+ONLY_ENV_VAR = "MILES_SC_HEAD_KL_ONLY"
+_ONLY = os.environ.get(ONLY_ENV_VAR, "") == "1"
+assert not _ONLY or _COEFFICIENT, f"{ONLY_ENV_VAR}=1 needs {ENV_VAR}"
 
 # A finite stand-in for minus infinity: exp(-1e4) is 0 in float32 and differences stay finite.
 _MASKED = -1.0e4
@@ -30,6 +37,10 @@ _MASKED = -1.0e4
 
 def coefficient() -> float:
     return _COEFFICIENT
+
+
+def only() -> bool:
+    return _ONLY
 
 
 def divergence(
