@@ -87,6 +87,8 @@ class _InputStats:
     and where their energy sits: the share of the tokens that holds 90% of the dimension's sum of squares
     (per pass, averaged) and its RMS by position (`_POSITIONS`): the token's position in its sequence when the
     batch is packed (`positions=sequence` in the line), along the input's first axis otherwise (`positions=row`).
+    The last sequence of a packed row is its padding (training_utils/data/rollout.py; a real sequence only when
+    the row needed none): it is left out of both and its RMS is given apart (`x<dim>_last_seq_rms`).
     """
 
     def __init__(self, name: str, attention: torch.nn.Module, entry: dict) -> None:
@@ -134,21 +136,26 @@ class _InputStats:
 
     def _add_dims(self, squares: torch.Tensor, shape: torch.Size) -> None:
         """`squares`: per token (rows, in the input's order) the square of x at each of the picked dimensions."""
-        ordered = squares.sort(0, descending=True).values.cumsum(0)
-        tokens90 = (ordered < 0.9 * ordered[-1]).sum(0) + 1
-        self._add("tokens90", tokens90 / squares.shape[0])
-        self._add("passes", torch.ones(()))
         self.shape = tuple(shape)
         if self.bounds is not None:
             self.positions = "sequence"
-            position = torch.full((squares.shape[0],), -1, device=squares.device)
-            for start, end in zip(self.bounds[:-1], self.bounds[1:], strict=True):
+            padding = squares[self.bounds[-2] : self.bounds[-1]]
+            self._add("last2", padding.sum(0))
+            self._add("lastn", torch.tensor(float(padding.shape[0])))
+            squares = squares[: self.bounds[-2]]
+            position = torch.empty(squares.shape[0], dtype=torch.long, device=squares.device)
+            for start, end in zip(self.bounds[:-2], self.bounds[1:-1], strict=True):
                 position[start:end] = torch.arange(end - start, device=squares.device)
         elif len(shape) == 3:
             self.positions = "row"
             position = torch.arange(shape[0], device=squares.device).repeat_interleave(shape[1])
         else:
-            return
+            self.positions = "none"
+            position = torch.full((squares.shape[0],), -1, device=squares.device)
+        ordered = squares.sort(0, descending=True).values.cumsum(0)
+        tokens90 = (ordered < 0.9 * ordered[-1]).sum(0) + 1
+        self._add("tokens90", tokens90 / squares.shape[0])
+        self._add("passes", torch.ones(()))
         for first, end in _POSITIONS:
             inside = (position >= first) & (position < end)
             self._add(f"pos2 {first}", squares[inside].sum(0))
@@ -162,11 +169,13 @@ class _InputStats:
         for dim in _INPUT_STATS_DIMS:
             share = float(mean[dim].square() / mean.square().sum())
             out.append(f"x{dim}_mean={float(mean[dim]):.4f} x{dim}_rms={float(mean2[dim].sqrt()):.4f} x{dim}_of_mean={share:.4f}")
-        out.append(f"shape={'x'.join(str(s) for s in self.shape)} positions={getattr(self, 'positions', 'none')}")
+        out.append(f"shape={'x'.join(str(s) for s in self.shape)} positions={self.positions}")
         for i, dim in enumerate(_INPUT_STATS_DIMS):
             out.append(f"x{dim}_tokens90={float(self.sums['tokens90'][i] / self.sums['passes']):.5f}")
             rms = [(self.sums[f"pos2 {first}"][i] / self.sums[f"posn {first}"].clamp_min(1)).sqrt() for first, _ in _POSITIONS if f"pos2 {first}" in self.sums]
             out.append(f"x{dim}_pos_rms=" + "/".join(f"{float(v):.3f}" for v in rms))
+            if "last2" in self.sums:
+                out.append(f"x{dim}_last_seq_rms={float((self.sums['last2'][i] / self.sums['lastn'].clamp_min(1)).sqrt()):.3f}")
         for label in ("w", "d"):
             mean, mean2 = self.sums[label] / n, self.sums[f"{label}2"] / n
             for part, rows in self.parts.items():
