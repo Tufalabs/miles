@@ -28,6 +28,10 @@ expert parallelism).
 
 MILES_SAMPLER_ADAPTER_LR=0 holds the offset where it starts: no divergence pass, one training pass a step. With
 MILES_SAMPLER_ADAPTER_INIT that is a fixed correction of the trainer's forward, fitted elsewhere.
+
+MILES_SAMPLER_ADAPTER_INPUT_STATS=1 logs per attention layer, over the tokens of the step's adapted passes, how
+much of what the offset adds to q, k and v is the same for every token (`_InputStats`). For a measurement at
+learning rate 0; it needs the whole of each linear_qkv.weight in the group.
 """
 
 import logging
@@ -58,6 +62,9 @@ _INIT = os.environ.get(INIT_ENV_VAR, "")
 assert _LR > 0 or _INIT, f"{LR_ENV_VAR}=0 holds the offset at zero without {INIT_ENV_VAR}"
 FREEZE_ENV_VAR = "MILES_SAMPLER_ADAPTER_FREEZE"
 _FREEZE = os.environ.get(FREEZE_ENV_VAR, "") == "1"
+INPUT_STATS_ENV_VAR = "MILES_SAMPLER_ADAPTER_INPUT_STATS"
+_INPUT_STATS = os.environ.get(INPUT_STATS_ENV_VAR, "") == "1"
+_INPUT_STATS_DIMS = tuple(int(d) for d in os.environ.get(f"{INPUT_STATS_ENV_VAR}_DIMS", "940").split(","))
 
 # Per adapted parameter: the parameter, the index of its adapted rows (a slice for all of it), the sampler's
 # values of those rows, the offset (fp32) and the step's gradient of the divergence on them.
@@ -65,6 +72,66 @@ _state: list[dict] = []
 _ready = False
 # The checkpoint the run loaded (its directory and step), whose saved offsets the first step restores.
 _loaded_checkpoint: tuple[str, int] | None = None
+_input_stats: list["_InputStats"] = []
+
+
+class _InputStats:
+    """What one layer's linear_qkv receives and what the offset makes of it, summed over tokens.
+
+    x is the layer's normalized input (RMSNorm with the layer's gain, as linear_qkv applies it before its
+    matrix). For x itself, for W x (the sampler's weight) and for D x (the offset), the share of the mean
+    square that the mean over tokens holds: |mean|^2 / mean |.|^2, per part (q, k, v rows). A share near 1
+    says the term is a constant added to every token: a bias. Also the mean and RMS of single dimensions of x.
+    """
+
+    def __init__(self, name: str, attention: torch.nn.Module, entry: dict) -> None:
+        self.name, self.entry = name, entry
+        weight = attention.linear_qkv.weight
+        self.gain = attention.linear_qkv.layer_norm_weight
+        self.parts = {part: _qkv_row_mask(attention, weight, part) for part in "qkv"}
+        self.eps = float(getattr(attention.linear_qkv, "eps", 1e-6))
+        self.reset()
+        attention.linear_qkv.register_forward_pre_hook(self._hook)
+
+    def reset(self) -> None:
+        self.tokens = 0
+        self.sums: dict[str, torch.Tensor] = {}
+
+    def _add(self, key: str, value: torch.Tensor) -> None:
+        value = value.double()
+        self.sums[key] = value if key not in self.sums else self.sums[key] + value
+
+    @torch.no_grad()
+    def _hook(self, module: torch.nn.Module, inputs: tuple) -> None:
+        if "sampler" not in self.entry:  # only passes through the adapted weights
+            return
+        hidden = inputs[0].detach().reshape(-1, inputs[0].shape[-1])
+        matrices = (("w", self.entry["sampler"].float()), ("d", self.entry["offset"]))
+        for chunk in hidden.split(8192):
+            chunk = chunk.float()
+            x = chunk * torch.rsqrt(chunk.square().mean(-1, keepdim=True) + self.eps) * self.gain.detach().float()
+            self.tokens += x.shape[0]
+            self._add("x", x.sum(0))
+            self._add("x2", x.square().sum(0))
+            for label, matrix in matrices:
+                y = x @ matrix.T
+                self._add(label, y.sum(0))
+                self._add(f"{label}2", y.square().sum(0))
+
+    def line(self) -> str:
+        n = self.tokens
+        out = [f"layer={self.name} tokens={n}"]
+        mean, mean2 = self.sums["x"] / n, self.sums["x2"] / n
+        out.append(f"x_const={float(mean.square().sum() / mean2.sum()):.4f}")
+        for dim in _INPUT_STATS_DIMS:
+            share = float(mean[dim].square() / mean.square().sum())
+            out.append(f"x{dim}_mean={float(mean[dim]):.4f} x{dim}_rms={float(mean2[dim].sqrt()):.4f} x{dim}_of_mean={share:.4f}")
+        for label in ("w", "d"):
+            mean, mean2 = self.sums[label] / n, self.sums[f"{label}2"] / n
+            for part, rows in self.parts.items():
+                out.append(f"{label}_{part}_const={float(mean[rows].square().sum() / mean2[rows].sum()):.4f}")
+                out.append(f"{label}_{part}_rms={float(mean2[rows].mean().sqrt()):.4e}")
+        return " ".join(out)
 
 
 def enabled() -> bool:
@@ -103,6 +170,14 @@ def _collect(model_chunks) -> None:
         entry["offset"] = torch.zeros_like(entry["param"].data[entry["rows"]], dtype=torch.float32)
         elements += entry["offset"].numel()
     _restore_offsets()
+    if _INPUT_STATS:
+        by_param = {id(entry["param"]): entry for entry in _state if entry["rows"] == slice(None)}
+        for chunk in model_chunks:
+            for name, module in chunk.named_modules():
+                linear_qkv = getattr(module, "linear_qkv", None)
+                if linear_qkv is not None and id(linear_qkv.weight) in by_param:
+                    _input_stats.append(_InputStats(name, module, by_param[id(linear_qkv.weight)]))
+        assert _input_stats, f"{INPUT_STATS_ENV_VAR} needs whole linear_qkv weights in {ENV_VAR}={_ENTRIES}"
     logger.info(
         "sampler adapter: entries=%s tensors=%d elements=%.4e lr=%g wd=%g freeze=%d (this rank)",
         _ENTRIES,
@@ -214,9 +289,12 @@ def finish(rollout_id: int) -> None:
             entry["offset"].mul_(1 - _LR * _WD).add_(gradient, alpha=-_LR)
         offset2 += float(entry["offset"].square().sum())
     _write(adapted=False)
+    for stats in _input_stats:
+        if stats.tokens:
+            logger.info("sampler adapter input stats rollout=%d %s (this rank)", rollout_id, stats.line())
+        stats.reset()
     logger.info(
-        "sampler adapter rollout=%d divergence_grad_norm=%.4e offset_norm=%.4e group_policy_grad_norm=%.4e"
-        " (this rank)",
+        "sampler adapter rollout=%d divergence_grad_norm=%.4e offset_norm=%.4e group_policy_grad_norm=%.4e (this rank)",
         rollout_id,
         gradient2**0.5,
         offset2**0.5,
