@@ -62,7 +62,7 @@ def _candidate_log_probs(args: Namespace, batch: RolloutBatch, logits: torch.Ten
             ids,
             group=parallel.tp.group if parallel.tp.size > 1 else None,
             vocab_size=args.backend.vocab_size if args.train_backend == "megatron" else None,
-            temperature=args.rollout_temperature,
+            temperature=args.rollout_temperature * _TRAINER_TEMPERATURE,
             chunk_size=args.log_probs_chunk_size,
             with_entropy=with_entropy and (not replay or support_only),
             sampling_support=support_only,
@@ -97,6 +97,10 @@ def _candidate_log_probs(args: Namespace, batch: RolloutBatch, logits: torch.Ten
 
 
 _SCALE_CANDIDATES = 8
+# Experiment (LLMT-83): the trainer scores at this multiple of the sampling temperature; the sampler is not
+# told. Above 1 the trainer's distribution is flatter than its own at the sampler's temperature: the control
+# for how much of a trainer-side correction is one scalar.
+_TRAINER_TEMPERATURE = float(os.environ.get("MILES_TRAINER_TEMPERATURE", "") or 1.0)
 
 
 def _logit_scale(
