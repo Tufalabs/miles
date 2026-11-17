@@ -33,6 +33,11 @@ MILES_SAMPLER_ADAPTER_INIT that is a fixed correction of the trainer's forward, 
 MILES_SAMPLER_ADAPTER_EVERY=<n> (default 1) takes the divergence pass and the offset's step only on the rollouts
 whose id is a multiple of n; the other steps hold the offset and take one training pass.
 
+MILES_SAMPLER_ADAPTER_RANK=<r> keeps the offset of every matrix in the group at rank r: after each step the
+offset is replaced by its rank-r approximation (`_truncate`). The q, k and v rows of a linear_qkv weight are
+three matrices, each at rank r. Vectors (norm gains) are left as they are. A low-rank offset holds less of
+one batch's noise per step, which is what a larger MILES_SAMPLER_ADAPTER_LR needs.
+
 MILES_SAMPLER_ADAPTER_INPUT_STATS=1 logs per attention layer, over the tokens of the step's adapted passes, how
 much of what the offset adds to q, k and v is the same for every token (`_InputStats`). For a measurement at
 learning rate 0; it needs the whole of each linear_qkv.weight in the group.
@@ -64,6 +69,10 @@ assert 0 <= _LR * _WD < 1, f"{WD_ENV_VAR}={_WD} with {LR_ENV_VAR}={_LR}: lr * wd
 EVERY_ENV_VAR = "MILES_SAMPLER_ADAPTER_EVERY"
 _EVERY = int(os.environ.get(EVERY_ENV_VAR, "") or 1)
 assert _EVERY >= 1, f"{EVERY_ENV_VAR}={_EVERY}: expected a positive number of steps"
+RANK_ENV_VAR = "MILES_SAMPLER_ADAPTER_RANK"
+_RANK = int(os.environ.get(RANK_ENV_VAR, "") or 0)
+assert _RANK >= 0, f"{RANK_ENV_VAR}={_RANK}: expected a rank, or 0 for no limit"
+_SUBSPACE_ROUNDS = 2
 INIT_ENV_VAR = "MILES_SAMPLER_ADAPTER_INIT"
 _INIT = os.environ.get(INIT_ENV_VAR, "")
 _INIT_OVER_CHECKPOINT = os.environ.get(f"{INIT_ENV_VAR}_OVER_CHECKPOINT", "") == "1"
@@ -197,6 +206,46 @@ def enabled() -> bool:
     return bool(_ENTRIES)
 
 
+@torch.no_grad()
+def _rank_blocks(model_chunks) -> None:
+    """Per adapted matrix, the row sets that are kept at rank _RANK: q, k and v of a whole linear_qkv weight, else
+    all of its adapted rows."""
+    attention_of = {}
+    for chunk in model_chunks:
+        for _, module in chunk.named_modules():
+            linear_qkv = getattr(module, "linear_qkv", None)
+            if linear_qkv is not None and hasattr(module, "num_query_groups_per_partition"):
+                attention_of[id(linear_qkv.weight)] = module
+    for entry in _state:
+        offset = entry["offset"]
+        if offset.dim() != 2:
+            continue
+        attention = attention_of.get(id(entry["param"])) if isinstance(entry["rows"], slice) else None
+        if attention is None:
+            masks = [torch.ones(offset.shape[0], dtype=torch.bool)]
+        else:
+            masks = [_qkv_row_mask(attention, entry["param"], part) for part in "qkv"]
+        entry["blocks"] = [{"rows": mask.to(offset.device), "basis": None} for mask in masks]
+
+
+@torch.no_grad()
+def _truncate(block: dict, offset: torch.Tensor) -> None:
+    """Replace the block's rows of the offset by a rank-_RANK approximation: its projection on the leading right
+    singular directions, found by subspace iteration that starts from the previous step's directions (from a
+    fixed random basis the first time, the same on every rank)."""
+    matrix = offset[block["rows"]]
+    rank = min(_RANK, *matrix.shape)
+    basis = block["basis"]
+    if basis is None:
+        generator = torch.Generator(device="cpu").manual_seed(0)
+        basis = torch.randn(matrix.shape[1], rank, generator=generator).to(matrix)
+    for _ in range(_SUBSPACE_ROUNDS):
+        left = torch.linalg.qr(matrix @ basis).Q
+        basis = torch.linalg.qr(matrix.T @ left).Q
+    offset[block["rows"]] = (matrix @ basis) @ basis.T
+    block["basis"] = basis
+
+
 def _grad_of(param: torch.Tensor) -> torch.Tensor:
     grad = getattr(param, "main_grad", None)  # config-access-exempt: DDP attaches main_grad at runtime
     return param.grad if grad is None else grad
@@ -229,6 +278,8 @@ def _collect(model_chunks) -> None:
         entry["offset"] = torch.zeros_like(entry["param"].data[entry["rows"]], dtype=torch.float32)
         elements += entry["offset"].numel()
     _restore_offsets()
+    if _RANK:
+        _rank_blocks(model_chunks)
     if _INPUT_STATS:
         by_param = {id(entry["param"]): entry for entry in _state if entry["rows"] == slice(None)}
         for chunk in model_chunks:
@@ -238,7 +289,7 @@ def _collect(model_chunks) -> None:
                     _input_stats.append(_InputStats(name, module, by_param[id(linear_qkv.weight)]))
         assert _input_stats, f"{INPUT_STATS_ENV_VAR} needs whole linear_qkv weights in {ENV_VAR}={_ENTRIES}"
     logger.info(
-        "sampler adapter: entries=%s tensors=%d elements=%.4e lr=%g wd=%g freeze=%d every=%d (this rank)",
+        "sampler adapter: entries=%s tensors=%d elements=%.4e lr=%g wd=%g freeze=%d every=%d rank=%d (this rank)",
         _ENTRIES,
         len(_state),
         elements,
@@ -246,6 +297,7 @@ def _collect(model_chunks) -> None:
         _WD,
         int(_FREEZE),
         _EVERY,
+        _RANK,
     )
 
 
@@ -349,6 +401,8 @@ def finish(rollout_id: int) -> None:
         if gradient is not None:
             gradient2 += float(gradient.square().sum())
             entry["offset"].mul_(1 - _LR * _WD).add_(gradient, alpha=-_LR)
+            for block in entry.get("blocks", ()):
+                _truncate(block, entry["offset"])
         offset2 += float(entry["offset"].square().sum())
     _write(adapted=False)
     for stats in _input_stats:
