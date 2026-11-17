@@ -171,7 +171,10 @@ async def train(startup_info: OrchestratorStartupInfo, *, disposer: Disposer):
                 await offload_train()
                 if args.offload_rollout:
                     await inference_controller.onload_weights()
-            await update_weights(args, actor_model, rollout_executor, inference_controller, rollout_id=rollout_id)
+            # --update-weights-interval N: the sampler gets new weights after every Nth rollout only, as in
+            # train_async.py; between pushes it samples from weights up to N - 1 steps old.
+            if (rollout_id + 1) % args.update_weights_interval == 0:
+                await update_weights(args, actor_model, rollout_executor, inference_controller, rollout_id=rollout_id)
             if args.offload_rollout:
                 await inference_controller.onload_kv()
 
