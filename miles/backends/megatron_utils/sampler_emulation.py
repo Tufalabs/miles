@@ -22,6 +22,9 @@ With MILES_GAIN_PENALTY or MILES_GAIN_PROJECTION set (loss/hub/gain_penalty.py) 
 the penalty's rounded pass.
 MILES_SAMPLER_EMULATION_DIVERGENCE=1 compares the rounded and the plain pass layer by layer (emulation_divergence.py).
 MILES_SAMPLER_EMULATION_LAYERS=<first>-<last> restricts the parts to those layers (inclusive); default all.
+MILES_SAMPLER_EMULATION_POSITIONS=<first>-<last> restricts the K and V parts to the tokens at those positions
+of their sequence (inclusive, from 0); the other tokens keep their exact K and V. Default all. It needs packed
+sequences (qkv_format thd).
 MILES_SAMPLER_EMULATION_SCORE_STATS=1 logs, once per layer, what K's NVFP4 rounding does to the attention
 scores and patterns of the first sequences of the first batch (it can be set without any part).
 CUDA only (Triton kernel).
@@ -43,6 +46,7 @@ ENV_VAR = "MILES_SAMPLER_EMULATION"
 STATS_ENV_VAR = "MILES_SAMPLER_EMULATION_STATS"
 SCORE_STATS_ENV_VAR = "MILES_SAMPLER_EMULATION_SCORE_STATS"
 LAYERS_ENV_VAR = "MILES_SAMPLER_EMULATION_LAYERS"
+POSITIONS_ENV_VAR = "MILES_SAMPLER_EMULATION_POSITIONS"
 _SCORE_STATS_SEQUENCES = 8
 _E4M3_MIN_NORMAL = 2.0**-6
 _E4M3_MIN_SUBNORMAL = 2.0**-9
@@ -148,6 +152,18 @@ def _nvfp4_kv(x: torch.Tensor, kernel: bool) -> torch.Tensor:
     return quantized * keep.to(quantized.dtype)
 
 
+def _position_mask(packed_seq_params, positions: tuple[int, int], like: torch.Tensor) -> torch.Tensor:
+    """Per token of a packed batch [tokens, ...]: whether its position in its sequence is in `positions`
+    (first, last; inclusive). Shaped to broadcast against `like`; padding after the last sequence is False."""
+    assert packed_seq_params is not None and like.dim() == 3, f"{POSITIONS_ENV_VAR} needs packed sequences (qkv_format thd)"
+    first, last = positions
+    mask = torch.zeros(like.shape[0], dtype=torch.bool, device=like.device)
+    bounds = packed_seq_params.cu_seqlens_host
+    for start, end in zip(bounds[:-1], bounds[1:], strict=True):
+        mask[min(start + first, end) : min(start + last + 1, end)] = True
+    return mask[:, None, None]
+
+
 def _block_scale_stats(x: torch.Tensor) -> str:
     """Where the NVFP4 block scales (amax / 6) of a K or V tensor fall in E4M3."""
     blocks = x.detach().float().reshape(-1, COMPRESSED_KV_BLOCK_SIZE)
@@ -221,8 +237,10 @@ def _wrap_core_attention(
     v_scale: float,
     score_stats_name: str | None = None,
     layer_name: str = "",
+    positions: tuple[int, int] | None = None,
 ) -> None:
-    """`v_scale`: the factor the sampler's V carries (MILES_SAMPLER_V_SCALE_LOG2); V is quantized at that scale."""
+    """`v_scale`: the factor the sampler's V carries (MILES_SAMPLER_V_SCALE_LOG2); V is quantized at that scale.
+    `positions`: the positions in a sequence (first, last) whose K and V are rounded; None for all."""
     original_forward = core_attention.forward
     pending_stats = [stats_name] if stats_name is not None else []
     pending_output_stats = list(pending_stats)
@@ -246,6 +264,7 @@ def _wrap_core_attention(
                 emulation_divergence.compare_patterns(layer_name, query, key, kwargs.get("packed_seq_params"))
             return original_forward(query, key, value, *args, **kwargs)
         kernel = "kv_nvfp4_kernel" in parts
+        exact_key, exact_value = key, value
         if "k_nvfp4_equalized" in parts:
             if not k_rms:
                 k_rms.append(_pair_rms(key))
@@ -258,6 +277,9 @@ def _wrap_core_attention(
             key = _nvfp4_kv(key, kernel)
         if kernel or "kv_nvfp4" in parts or "v_nvfp4" in parts:
             value = _nvfp4_kv(value * v_scale, kernel) * (1.0 / v_scale)
+        if positions is not None and (key is not exact_key or value is not exact_value):
+            mask = _position_mask(kwargs.get("packed_seq_params"), positions, exact_key)
+            key, value = torch.where(mask, key, exact_key), torch.where(mask, value, exact_value)
         if "q_fp8" in parts:
             query = _fp8_straight_through(query)
         if emulation_divergence.enabled():
@@ -283,6 +305,9 @@ def maybe_install_sampler_emulation(model_chunks) -> None:
     unknown = parts - set(PARTS)
     assert not unknown, f"{ENV_VAR}: unknown parts {sorted(unknown)}, expected a subset of {PARTS}"
     first, last = (int(bound) for bound in os.environ.get(LAYERS_ENV_VAR, "0-100000").split("-"))
+    positions_spec = os.environ.get(POSITIONS_ENV_VAR, "").strip()
+    positions = tuple(int(bound) for bound in positions_spec.split("-")) if positions_spec else None
+    assert positions is None or (len(positions) == 2 and 0 <= positions[0] <= positions[1]), f"{POSITIONS_ENV_VAR}={positions_spec}: expected <first>-<last>"
     wrapped, emulating = 0, 0
     for chunk in model_chunks:
         for name, module in chunk.named_modules():
@@ -297,9 +322,10 @@ def maybe_install_sampler_emulation(model_chunks) -> None:
                     v_scale,
                     name if score_stats else None,
                     layer_name=name.removesuffix(".self_attention"),
+                    positions=positions,
                 )
                 wrapped += 1
                 emulating += bool(layer_parts)
     assert wrapped > 0, f"{ENV_VAR} is set but no self_attention.core_attention module was found"
-    logger.info("sampler emulation installed: parts=%s in %d of %d layers (layers %d to %d)", sorted(parts), emulating, wrapped, first, last)
+    logger.info("sampler emulation installed: parts=%s in %d of %d layers (layers %d to %d), K and V positions %s", sorted(parts), emulating, wrapped, first, last, positions_spec or "all")
     emulation_divergence.maybe_install(model_chunks)

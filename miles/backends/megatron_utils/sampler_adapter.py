@@ -85,7 +85,8 @@ class _InputStats:
     square that the mean over tokens holds: |mean|^2 / mean |.|^2, per part (q, k, v rows). A share near 1
     says the term is a constant added to every token: a bias. Also the mean and RMS of single dimensions of x,
     and where their energy sits: the share of the tokens that holds 90% of the dimension's sum of squares
-    (per pass, averaged) and its RMS by position along the input's first axis (`_POSITIONS`).
+    (per pass, averaged) and its RMS by position (`_POSITIONS`): the token's position in its sequence when the
+    batch is packed (`positions=sequence` in the line), along the input's first axis otherwise (`positions=row`).
     """
 
     def __init__(self, name: str, attention: torch.nn.Module, entry: dict) -> None:
@@ -94,7 +95,9 @@ class _InputStats:
         self.gain = attention.linear_qkv.layer_norm_weight
         self.parts = {part: _qkv_row_mask(attention, weight, part) for part in "qkv"}
         self.eps = float(getattr(attention.linear_qkv, "eps", 1e-6))
+        self.bounds: tuple[int, ...] | None = None
         self.reset()
+        attention.register_forward_pre_hook(self._capture_bounds, with_kwargs=True)
         attention.linear_qkv.register_forward_pre_hook(self._hook)
 
     def reset(self) -> None:
@@ -104,6 +107,10 @@ class _InputStats:
     def _add(self, key: str, value: torch.Tensor) -> None:
         value = value.double()
         self.sums[key] = value if key not in self.sums else self.sums[key] + value
+
+    def _capture_bounds(self, module: torch.nn.Module, args: tuple, kwargs: dict) -> None:
+        """The sequence bounds of a packed batch, for the linear_qkv call that follows."""
+        self.bounds = getattr(kwargs.get("packed_seq_params"), "cu_seqlens_host", None)
 
     @torch.no_grad()
     def _hook(self, module: torch.nn.Module, inputs: tuple) -> None:
@@ -131,13 +138,21 @@ class _InputStats:
         tokens90 = (ordered < 0.9 * ordered[-1]).sum(0) + 1
         self._add("tokens90", tokens90 / squares.shape[0])
         self._add("passes", torch.ones(()))
-        if len(shape) == 3:
-            by_position = squares.reshape(shape[0], shape[1], -1)
-            for first, end in _POSITIONS:
-                block = by_position[first:end]
-                self._add(f"pos2 {first}", block.sum((0, 1)))
-                self._add(f"posn {first}", torch.tensor(float(block.shape[0] * block.shape[1])))
         self.shape = tuple(shape)
+        if self.bounds is not None:
+            self.positions = "sequence"
+            position = torch.full((squares.shape[0],), -1, device=squares.device)
+            for start, end in zip(self.bounds[:-1], self.bounds[1:], strict=True):
+                position[start:end] = torch.arange(end - start, device=squares.device)
+        elif len(shape) == 3:
+            self.positions = "row"
+            position = torch.arange(shape[0], device=squares.device).repeat_interleave(shape[1])
+        else:
+            return
+        for first, end in _POSITIONS:
+            inside = (position >= first) & (position < end)
+            self._add(f"pos2 {first}", squares[inside].sum(0))
+            self._add(f"posn {first}", inside.sum())
 
     def line(self) -> str:
         n = self.tokens
@@ -147,7 +162,7 @@ class _InputStats:
         for dim in _INPUT_STATS_DIMS:
             share = float(mean[dim].square() / mean.square().sum())
             out.append(f"x{dim}_mean={float(mean[dim]):.4f} x{dim}_rms={float(mean2[dim].sqrt()):.4f} x{dim}_of_mean={share:.4f}")
-        out.append(f"shape={'x'.join(str(s) for s in self.shape)}")
+        out.append(f"shape={'x'.join(str(s) for s in self.shape)} positions={getattr(self, 'positions', 'none')}")
         for i, dim in enumerate(_INPUT_STATS_DIMS):
             out.append(f"x{dim}_tokens90={float(self.sums['tokens90'][i] / self.sums['passes']):.5f}")
             rms = [(self.sums[f"pos2 {first}"][i] / self.sums[f"posn {first}"].clamp_min(1)).sqrt() for first, _ in _POSITIONS if f"pos2 {first}" in self.sums]
