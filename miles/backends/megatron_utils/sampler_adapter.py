@@ -22,7 +22,12 @@ doubles the training passes of a step.
 
 The offset is saved next to each checkpoint, one file per rank
 (<checkpoints>/sampler_adapter_iter_<step>/rank<rank>.pt), and a run that loads that checkpoint starts from it.
-A checkpoint without such files starts the offset from zero.
+A checkpoint without such files starts the offset from zero, or from MILES_SAMPLER_ADAPTER_INIT=<file>: one
+such file, read by every rank (the group must be one whose values the ranks share, as attention's are under
+expert parallelism).
+
+MILES_SAMPLER_ADAPTER_LR=0 holds the offset where it starts: no divergence pass, one training pass a step. With
+MILES_SAMPLER_ADAPTER_INIT that is a fixed correction of the trainer's forward, fitted elsewhere.
 """
 
 import logging
@@ -48,6 +53,9 @@ _LR = float(os.environ.get(LR_ENV_VAR, "") or 0.02)
 WD_ENV_VAR = "MILES_SAMPLER_ADAPTER_WD"
 _WD = float(os.environ.get(WD_ENV_VAR, "") or 0.0)
 assert 0 <= _LR * _WD < 1, f"{WD_ENV_VAR}={_WD} with {LR_ENV_VAR}={_LR}: lr * wd must be in [0, 1)"
+INIT_ENV_VAR = "MILES_SAMPLER_ADAPTER_INIT"
+_INIT = os.environ.get(INIT_ENV_VAR, "")
+assert _LR > 0 or _INIT, f"{LR_ENV_VAR}=0 holds the offset at zero without {INIT_ENV_VAR}"
 FREEZE_ENV_VAR = "MILES_SAMPLER_ADAPTER_FREEZE"
 _FREEZE = os.environ.get(FREEZE_ENV_VAR, "") == "1"
 
@@ -120,12 +128,12 @@ def loaded_checkpoint(checkpoints_dir: str, iteration: int) -> None:
 
 @torch.no_grad()
 def _restore_offsets() -> None:
-    if _loaded_checkpoint is None:
-        return
-    path = _offsets_file(*_loaded_checkpoint)
-    if not path.is_file():
-        logger.info("sampler adapter: no saved offsets at %s, starting from zero (this rank)", path)
-        return
+    path = _offsets_file(*_loaded_checkpoint) if _loaded_checkpoint is not None else None
+    if path is None or not path.is_file():
+        if not _INIT:
+            logger.info("sampler adapter: no saved offsets at %s, starting from zero (this rank)", path)
+            return
+        path = Path(_INIT)
     saved = torch.load(path, map_location="cpu", weights_only=True)
     names = [entry["name"] for entry in _state]
     assert saved["names"] == names, f"{path} holds offsets of other parameters than {ENV_VAR}={_ENTRIES} names"
@@ -176,6 +184,8 @@ def measure(
     if not _ready:
         _collect(model_chunks)
     _write(adapted=True)
+    if _LR == 0:
+        return
     offsets = [iterator.offset for iterator in data_iterator]
     with score_centering_head_kl.divergence_phase():
         run_pass(num_microbatches)
@@ -198,9 +208,10 @@ def finish(rollout_id: int) -> None:
         policy2 += float(grad[entry["rows"]].float().square().sum())
         if _FREEZE:
             grad[entry["rows"]] = 0
-        gradient = entry.pop("gradient")
-        gradient2 += float(gradient.square().sum())
-        entry["offset"].mul_(1 - _LR * _WD).add_(gradient, alpha=-_LR)
+        if _LR > 0:
+            gradient = entry.pop("gradient")
+            gradient2 += float(gradient.square().sum())
+            entry["offset"].mul_(1 - _LR * _WD).add_(gradient, alpha=-_LR)
         offset2 += float(entry["offset"].square().sum())
     _write(adapted=False)
     logger.info(
