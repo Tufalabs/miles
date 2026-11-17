@@ -24,7 +24,8 @@ The offset is saved next to each checkpoint, one file per rank
 (<checkpoints>/sampler_adapter_iter_<step>/rank<rank>.pt), and a run that loads that checkpoint starts from it.
 A checkpoint without such files starts the offset from zero, or from MILES_SAMPLER_ADAPTER_INIT=<file>: one
 such file, read by every rank (the group must be one whose values the ranks share, as attention's are under
-expert parallelism).
+expert parallelism). MILES_SAMPLER_ADAPTER_INIT_OVER_CHECKPOINT=1 uses that file even when the checkpoint has
+offsets of its own.
 
 MILES_SAMPLER_ADAPTER_LR=0 holds the offset where it starts: no divergence pass, one training pass a step. With
 MILES_SAMPLER_ADAPTER_INIT that is a fixed correction of the trainer's forward, fitted elsewhere.
@@ -65,6 +66,8 @@ _EVERY = int(os.environ.get(EVERY_ENV_VAR, "") or 1)
 assert _EVERY >= 1, f"{EVERY_ENV_VAR}={_EVERY}: expected a positive number of steps"
 INIT_ENV_VAR = "MILES_SAMPLER_ADAPTER_INIT"
 _INIT = os.environ.get(INIT_ENV_VAR, "")
+_INIT_OVER_CHECKPOINT = os.environ.get(f"{INIT_ENV_VAR}_OVER_CHECKPOINT", "") == "1"
+assert _INIT or not _INIT_OVER_CHECKPOINT, f"{INIT_ENV_VAR}_OVER_CHECKPOINT=1 needs {INIT_ENV_VAR}"
 assert _LR > 0 or _INIT, f"{LR_ENV_VAR}=0 holds the offset at zero without {INIT_ENV_VAR}"
 FREEZE_ENV_VAR = "MILES_SAMPLER_ADAPTER_FREEZE"
 _FREEZE = os.environ.get(FREEZE_ENV_VAR, "") == "1"
@@ -261,7 +264,7 @@ def loaded_checkpoint(checkpoints_dir: str, iteration: int) -> None:
 @torch.no_grad()
 def _restore_offsets() -> None:
     path = _offsets_file(*_loaded_checkpoint) if _loaded_checkpoint is not None else None
-    if path is None or not path.is_file():
+    if path is None or not path.is_file() or _INIT_OVER_CHECKPOINT:
         if not _INIT:
             logger.info("sampler adapter: no saved offsets at %s, starting from zero (this rank)", path)
             return
