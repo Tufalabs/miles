@@ -73,6 +73,8 @@ _ready = False
 # The checkpoint the run loaded (its directory and step), whose saved offsets the first step restores.
 _loaded_checkpoint: tuple[str, int] | None = None
 _input_stats: list["_InputStats"] = []
+# Position buckets (first index, one past the last) for the per-dimension RMS of the input statistics.
+_POSITIONS = ((0, 1), (1, 2), (2, 4), (4, 8), (8, 16), (16, 64), (64, 256), (256, 10**9))
 
 
 class _InputStats:
@@ -81,7 +83,9 @@ class _InputStats:
     x is the layer's normalized input (RMSNorm with the layer's gain, as linear_qkv applies it before its
     matrix). For x itself, for W x (the sampler's weight) and for D x (the offset), the share of the mean
     square that the mean over tokens holds: |mean|^2 / mean |.|^2, per part (q, k, v rows). A share near 1
-    says the term is a constant added to every token: a bias. Also the mean and RMS of single dimensions of x.
+    says the term is a constant added to every token: a bias. Also the mean and RMS of single dimensions of x,
+    and where their energy sits: the share of the tokens that holds 90% of the dimension's sum of squares
+    (per pass, averaged) and its RMS by position along the input's first axis (`_POSITIONS`).
     """
 
     def __init__(self, name: str, attention: torch.nn.Module, entry: dict) -> None:
@@ -107,9 +111,11 @@ class _InputStats:
             return
         hidden = inputs[0].detach().reshape(-1, inputs[0].shape[-1])
         matrices = (("w", self.entry["sampler"].float()), ("d", self.entry["offset"]))
+        picked = []
         for chunk in hidden.split(8192):
             chunk = chunk.float()
             x = chunk * torch.rsqrt(chunk.square().mean(-1, keepdim=True) + self.eps) * self.gain.detach().float()
+            picked.append(x[:, list(_INPUT_STATS_DIMS)])
             self.tokens += x.shape[0]
             self._add("x", x.sum(0))
             self._add("x2", x.square().sum(0))
@@ -117,6 +123,21 @@ class _InputStats:
                 y = x @ matrix.T
                 self._add(label, y.sum(0))
                 self._add(f"{label}2", y.square().sum(0))
+        self._add_dims(torch.cat(picked).square(), inputs[0].shape)
+
+    def _add_dims(self, squares: torch.Tensor, shape: torch.Size) -> None:
+        """`squares`: per token (rows, in the input's order) the square of x at each of the picked dimensions."""
+        ordered = squares.sort(0, descending=True).values.cumsum(0)
+        tokens90 = (ordered < 0.9 * ordered[-1]).sum(0) + 1
+        self._add("tokens90", tokens90 / squares.shape[0])
+        self._add("passes", torch.ones(()))
+        if len(shape) == 3:
+            by_position = squares.reshape(shape[0], shape[1], -1)
+            for first, end in _POSITIONS:
+                block = by_position[first:end]
+                self._add(f"pos2 {first}", block.sum((0, 1)))
+                self._add(f"posn {first}", torch.tensor(float(block.shape[0] * block.shape[1])))
+        self.shape = tuple(shape)
 
     def line(self) -> str:
         n = self.tokens
@@ -126,6 +147,11 @@ class _InputStats:
         for dim in _INPUT_STATS_DIMS:
             share = float(mean[dim].square() / mean.square().sum())
             out.append(f"x{dim}_mean={float(mean[dim]):.4f} x{dim}_rms={float(mean2[dim].sqrt()):.4f} x{dim}_of_mean={share:.4f}")
+        out.append(f"shape={'x'.join(str(s) for s in self.shape)}")
+        for i, dim in enumerate(_INPUT_STATS_DIMS):
+            out.append(f"x{dim}_tokens90={float(self.sums['tokens90'][i] / self.sums['passes']):.5f}")
+            rms = [(self.sums[f"pos2 {first}"][i] / self.sums[f"posn {first}"].clamp_min(1)).sqrt() for first, _ in _POSITIONS if f"pos2 {first}" in self.sums]
+            out.append(f"x{dim}_pos_rms=" + "/".join(f"{float(v):.3f}" for v in rms))
         for label in ("w", "d"):
             mean, mean2 = self.sums[label] / n, self.sums[f"{label}2"] / n
             for part, rows in self.parts.items():
