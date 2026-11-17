@@ -647,6 +647,7 @@ def train_one_step(
                 model,
                 lambda: _zero_grads(model, optimizer, disable_optimizer),
                 num_microbatches,
+                rollout_id=rollout_id,
             )
         gain_penalty_grads = None
         if gain_penalty.projection_enabled():
