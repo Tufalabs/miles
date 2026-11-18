@@ -35,6 +35,9 @@ MILES_SAMPLER_ADAPTER_INIT that is a fixed correction of the trainer's forward, 
 
 MILES_SAMPLER_ADAPTER_EVERY=<n> (default 1) takes the divergence pass and the offset's step only on the rollouts
 whose id is a multiple of n; the other steps hold the offset and take one training pass.
+MILES_SAMPLER_ADAPTER_WARMUP=<w> (default 0) updates on every one of the first w rollouts this process sees,
+whatever n is: an offset that starts from zero is fitted in tens of updates, which at n = 10 would take
+hundreds of steps.
 
 MILES_SAMPLER_ADAPTER_RANK=<r> keeps the offset of every matrix in the group at rank r: after each step the
 offset is replaced by its rank-r approximation (`_truncate`). The q, k and v rows of a linear_qkv weight are
@@ -75,6 +78,9 @@ assert _CLIP >= 0, f"{CLIP_ENV_VAR}={_CLIP}: a norm, 0 for no cap"
 EVERY_ENV_VAR = "MILES_SAMPLER_ADAPTER_EVERY"
 _EVERY = int(os.environ.get(EVERY_ENV_VAR, "") or 1)
 assert _EVERY >= 1, f"{EVERY_ENV_VAR}={_EVERY}: expected a positive number of steps"
+WARMUP_ENV_VAR = "MILES_SAMPLER_ADAPTER_WARMUP"
+_WARMUP = int(os.environ.get(WARMUP_ENV_VAR, "") or 0)
+_first_rollout = None  # the id of the first rollout this process trains on (a resumed run starts later)
 RANK_ENV_VAR = "MILES_SAMPLER_ADAPTER_RANK"
 _RANK = int(os.environ.get(RANK_ENV_VAR, "") or 0)
 assert _RANK >= 0, f"{RANK_ENV_VAR}={_RANK}: expected a rank, or 0 for no limit"
@@ -375,11 +381,15 @@ def measure(
 ) -> None:
     """Add the offset to the group and take the gradient of the divergence on it from a pass of its own; leaves
     the gradients zeroed, the data iterators where they were and the offset in the weights for the policy pass.
-    On a rollout that MILES_SAMPLER_ADAPTER_EVERY skips, and at learning rate 0, it only adds the offset."""
+    On a rollout that MILES_SAMPLER_ADAPTER_EVERY skips (after MILES_SAMPLER_ADAPTER_WARMUP), and at learning
+    rate 0, it only adds the offset."""
     if not _ready:
         _collect(model_chunks)
     _write(adapted=True)
-    if _LR == 0 or rollout_id % _EVERY != 0:
+    global _first_rollout
+    if _first_rollout is None:
+        _first_rollout = rollout_id
+    if _LR == 0 or (rollout_id % _EVERY != 0 and rollout_id - _first_rollout >= _WARMUP):
         return
     offsets = [iterator.offset for iterator in data_iterator]
     with score_centering_head_kl.divergence_phase():
