@@ -15,6 +15,9 @@ to them for its forward passes. Each training step:
      offset - lr * gradient (MILES_SAMPLER_ADAPTER_LR, default 0.02; MILES_SAMPLER_ADAPTER_WD, default 0).
      The weight decay gives the offset a memory of 1 / (lr * wd) steps: it holds what the last steps'
      divergence supports and forgets the rest, so that it does not accumulate a change of its own.
+     MILES_SAMPLER_ADAPTER_CLIP=<c> scales a step's gradient down to norm c (over all adapted weights) when
+     it is larger: an ordinary step has norm 0.1 to 0.4, and the runs that collapsed did so by a few steps
+     of norm 5 to 200 that took the offset from 0.4 to 12 (jobs 4978, 5064 and 5058).
 
 So the sampler never receives the offset and the policy loss never trains it. The offset is kept in fp32; the
 model's bf16 values during the passes are the rounded sum of the sampler's bf16 values and the offset. It
@@ -66,6 +69,9 @@ _LR = float(os.environ.get(LR_ENV_VAR, "") or 0.02)
 WD_ENV_VAR = "MILES_SAMPLER_ADAPTER_WD"
 _WD = float(os.environ.get(WD_ENV_VAR, "") or 0.0)
 assert 0 <= _LR * _WD < 1, f"{WD_ENV_VAR}={_WD} with {LR_ENV_VAR}={_LR}: lr * wd must be in [0, 1)"
+CLIP_ENV_VAR = "MILES_SAMPLER_ADAPTER_CLIP"
+_CLIP = float(os.environ.get(CLIP_ENV_VAR, "") or 0.0)
+assert _CLIP >= 0, f"{CLIP_ENV_VAR}={_CLIP}: a norm, 0 for no cap"
 EVERY_ENV_VAR = "MILES_SAMPLER_ADAPTER_EVERY"
 _EVERY = int(os.environ.get(EVERY_ENV_VAR, "") or 1)
 assert _EVERY >= 1, f"{EVERY_ENV_VAR}={_EVERY}: expected a positive number of steps"
@@ -393,14 +399,17 @@ def finish(rollout_id: int) -> None:
     MILES_SAMPLER_ADAPTER_FREEZE no policy gradient for the group."""
     gradient2, offset2, policy2 = 0.0, 0.0, 0.0
     for entry in _state:
+        if entry.get("gradient") is not None:
+            gradient2 += float(entry["gradient"].square().sum())
+    scale = min(1.0, _CLIP / gradient2**0.5) if _CLIP and gradient2 > 0 else 1.0
+    for entry in _state:
         grad = _grad_of(entry["param"])
         policy2 += float(grad[entry["rows"]].float().square().sum())
         if _FREEZE:
             grad[entry["rows"]] = 0
         gradient = entry.pop("gradient", None)  # None: no divergence pass this step
         if gradient is not None:
-            gradient2 += float(gradient.square().sum())
-            entry["offset"].mul_(1 - _LR * _WD).add_(gradient, alpha=-_LR)
+            entry["offset"].mul_(1 - _LR * _WD).add_(gradient, alpha=-_LR * scale)
             for block in entry.get("blocks", ()):
                 _truncate(block, entry["offset"])
         offset2 += float(entry["offset"].square().sum())
