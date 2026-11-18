@@ -1,3 +1,4 @@
+from . import quantizer_fake_int
 from .padding_remover import remove_padding
 from .quantizer_compressed_tensors import quantize_params_compressed_tensors
 from .quantizer_fp8 import quantize_params_fp8
@@ -16,6 +17,8 @@ __all__ = [
 
 def quantize_params(args, megatron_name, converted_named_params, quantization_config, packed_weight_basenames=None):
     if quantization_config is None:
+        if quantizer_fake_int.enabled():
+            return quantizer_fake_int.change_params(converted_named_params)
         return converted_named_params
     elif quantization_config["quant_method"] == "fp8":
         return quantize_params_fp8(args, megatron_name, converted_named_params, quantization_config)
