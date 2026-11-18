@@ -20,9 +20,15 @@ from miles.utils import async_utils
 from miles.utils.lora.utils import lora_rollout_enabled
 
 try:
-    from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket  # type: ignore[import]
+    from sglang.srt.weight_sync.tensor_bucket import (  # type: ignore[import]
+        FlattenedTensorBucket,
+        FlattenedTensorMetadata,
+    )
 except ImportError:
-    from sglang.srt.model_executor.model_runner import FlattenedTensorBucket  # type: ignore[import]
+    from sglang.srt.model_executor.model_runner import (  # type: ignore[import]
+        FlattenedTensorBucket,
+        FlattenedTensorMetadata,
+    )
 
 from .broadcast import (
     connect_rollout_engines_from_distributed,
@@ -52,6 +58,7 @@ class UpdateWeightFromTensor(WeightTransferProtocol):
         self._model_update_groups = None
         # Overwritten with "miles" when connect finds a distributed engine tail.
         self.group_name = "miles-colocate"
+        self._bucket_block = _BucketBlock(self.args.update_weight_buffer_size)
 
         for start_rank in range(0, dist.get_world_size(), self.args.rollout_num_gpus_per_engine):
             end_rank = min(start_rank + self.args.rollout_num_gpus_per_engine, dist.get_world_size())
@@ -174,6 +181,7 @@ class UpdateWeightFromTensor(WeightTransferProtocol):
             ipc_gather_group=self._ipc_gather_group,
             selector=self._selector,
             stacked_expert_format=self.send_stacked_experts,
+            bucket_block=self._bucket_block,
         )
         if self.use_distribute and self._is_distributed_src_rank:
             futures_distributed = update_weights_from_distributed(
@@ -192,12 +200,9 @@ class UpdateWeightFromTensor(WeightTransferProtocol):
         if self._ipc_gather_group is not None:
             dist.barrier(group=self._ipc_gather_group)
         del long_lived_tensors
-        # A shared bucket stays allocated until its receiver has let go of it and this process collects it. Without
-        # a collection here every bucket of an update is a fresh allocation that lives to the update's end, a full
-        # copy of the engine's weights in temporaries; with it the next buckets reuse the blocks.
-        torch.cuda.ipc_collect()
 
     def after_engines_resumed(self) -> None:
+        self._bucket_block.release()
         torch.cuda.ipc_collect()
         if not self.args.update_weight_keep_cuda_cache:
             torch.cuda.empty_cache()
@@ -211,6 +216,7 @@ def _send_to_colocated_engine(
     ipc_gather_group,
     selector: str = "all",
     stacked_expert_format: bool = False,
+    bucket_block: "_BucketBlock | None" = None,
 ) -> tuple[list[Future], Any]:
     # Placeholder ranks (GPU slots reserved but no engine) have no gather group.
     # gather_object is only collective among group members, so we skip entirely.
@@ -234,7 +240,10 @@ def _send_to_colocated_engine(
 
     serialized_tensors: list = []
     for _dtype, named_tensors in converted_named_tensors_by_dtypes.items():
-        flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+        if bucket_block is not None and len(converted_named_tensors_by_dtypes) == 1:
+            flattened_tensor_bucket = bucket_block.flatten(named_tensors)
+        else:
+            flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
         if stacked_expert_format:
             # A custom loader's request is a list of (name, tensor): the bucket's layout travels in the name.
             flattened_tensor_data = [
@@ -272,6 +281,52 @@ def _send_to_colocated_engine(
             futures.append(async_utils.submit(_update_weights_from_tensor_gated(ipc_gate, ipc_engine, kwargs)))
 
     return futures, long_live_tensors
+
+
+class _BucketBlock:
+    """One block of memory for all the flattened buckets of an update.
+
+    A bucket handed to an engine over CUDA IPC stays allocated on the sender until the engine has dropped it and the
+    sender has collected it, so with a block per bucket an update holds a full copy of the engine's weights in
+    temporaries (31 GB of reserved memory for the 29 GB FP8 sampler). The engine reads a bucket only inside the
+    request that carries it, and send_bucket returns after the reply and the group's barrier, so the next bucket can
+    be written over it. The block is dropped after the update: sharing a storage wraps its allocation once more each
+    time, which must not accumulate over a run.
+    """
+
+    def __init__(self, bucket_bytes: int) -> None:
+        self._bucket_bytes = bucket_bytes
+        self._block: torch.Tensor | None = None
+
+    def flatten(self, named_tensors: list[tuple[str, torch.Tensor]]) -> FlattenedTensorBucket:
+        """FlattenedTensorBucket(named_tensors=...), with the bytes in this object's block."""
+        if not named_tensors:
+            raise ValueError("Cannot create empty tensor bucket")
+        parts = [tensor.flatten().view(torch.uint8) for _name, tensor in named_tensors]
+        metadata = []
+        offset = 0
+        for (name, tensor), part in zip(named_tensors, parts, strict=True):
+            metadata.append(
+                FlattenedTensorMetadata(
+                    name=name,
+                    shape=tensor.shape,
+                    dtype=tensor.dtype,
+                    start_idx=offset,
+                    end_idx=offset + part.numel(),
+                    numel=part.numel(),
+                )
+            )
+            offset += part.numel()
+        device = parts[0].device
+        if self._block is None or self._block.numel() < offset or self._block.device != device:
+            self._block = None
+            self._block = torch.empty(max(offset, self._bucket_bytes), dtype=torch.uint8, device=device)
+        flattened_tensor = self._block[:offset]
+        torch.cat(parts, dim=0, out=flattened_tensor)
+        return FlattenedTensorBucket(flattened_tensor=flattened_tensor, metadata=metadata)
+
+    def release(self) -> None:
+        self._block = None
 
 
 async def _update_weights_from_tensor_gated(
