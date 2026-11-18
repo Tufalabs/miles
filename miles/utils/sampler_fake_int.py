@@ -10,11 +10,20 @@ MILES_SAMPLER_FAKE_INT_ACT=<bits>  the inputs of the matrices that the weight ro
     symmetric integer grid of 2 ** bits - 1 levels, per token (scale = the largest magnitude over the last
     dimension / (2 ** (bits - 1) - 1)): the input of the q/k/v projection, of the attention output projection, of
     the experts (their gate and up projections) and of the experts' down projection. The router reads the
-    unrounded input, as it keeps its weights.
+    unrounded input, as it keeps its weights. The down projection's input exists in Python only with the Triton
+    MoE runner (--sglang-moe-runner-backend triton); the default runner for bf16 experts on SM100
+    (flashinfer_trtllm) computes both expert products in one kernel, and that input stays unrounded.
 MILES_SAMPLER_FAKE_INT_KV=<bits>   the key and value of every token are rounded the same way per head, after the
     q/k norm and RoPE and before the KV cache and the attention kernel, so that everything attention reads, the
-    current token's key and value included, is on the grid. The engine keeps a bf16 KV cache; its fused write of
-    K and V in the RoPE kernel is switched off by the patch.
+    current token's key and value included, is on the grid. <key bits>,<value bits> rounds them to different
+    grids, 0 leaving that one unrounded. The engine keeps a bf16 KV cache; its fused write of K and V in the RoPE
+    kernel is switched off by the patch.
+MILES_SAMPLER_FAKE_INT_KV_GROUP=<n>  one scale per n consecutive values of a head's key or value in place of one
+    per head (n divides head_dim): the finer the scales, the smaller the rounding error at the same bits.
+
+Measured at learning rate 0 on Qwen3-30B-A3B-Base (6 rollouts of 128 answers, plain bf16 engine otherwise):
+activations at 8 bits KL 0.002 and accuracy 0.49; KV at 6 bits 0.009 and 0.47, at 5 bits 0.030 and 0.42, at 4
+bits 0.23 and 0.04.
 
 The rounding is done in float32 and stored in the tensor's dtype: bf16 keeps a value to 2 ** -8 of itself, which
 is up to half a grid step at the top of an 8-bit grid (measured 0.42) and under a tenth of one from 6 bits down.
@@ -30,13 +39,23 @@ logger = logging.getLogger(__name__)
 
 ACT_ENV_VAR = "MILES_SAMPLER_FAKE_INT_ACT"
 KV_ENV_VAR = "MILES_SAMPLER_FAKE_INT_KV"
+KV_GROUP_ENV_VAR = "MILES_SAMPLER_FAKE_INT_KV_GROUP"
 ACT_BITS = int(os.environ.get(ACT_ENV_VAR, "") or 0)
-KV_BITS = int(os.environ.get(KV_ENV_VAR, "") or 0)
+_kv = [int(bits) for bits in (os.environ.get(KV_ENV_VAR, "") or "0").split(",")]
+assert len(_kv) in (1, 2), f"{KV_ENV_VAR}: <bits> or <key bits>,<value bits>"
+K_BITS, V_BITS = _kv[0], _kv[-1]
+KV_BITS = max(K_BITS, V_BITS)  # not 0: K or V is rounded (the patch asks this)
+KV_GROUP = int(os.environ.get(KV_GROUP_ENV_VAR, "") or 0)
 assert ACT_BITS == 0 or 2 <= ACT_BITS <= 8, f"{ACT_ENV_VAR}={ACT_BITS}: 2 to 8 bits, or unset"
-assert KV_BITS == 0 or 2 <= KV_BITS <= 8, f"{KV_ENV_VAR}={KV_BITS}: 2 to 8 bits, or unset"
+assert all(bits == 0 or 2 <= bits <= 8 for bits in _kv), f"{KV_ENV_VAR}={_kv}: 2 to 8 bits each, 0 or unset for off"
 _seen: set[str] = set()
 logger.warning(
-    "sampler fake int: activations %d bits, KV cache %d bits (0: off), pid %d", ACT_BITS, KV_BITS, os.getpid()
+    "sampler fake int: activations %d bits, keys %d bits, values %d bits (0: off), a KV scale per %s values, pid %d",
+    ACT_BITS,
+    K_BITS,
+    V_BITS,
+    KV_GROUP or "head_dim",
+    os.getpid(),
 )
 
 
@@ -63,12 +82,14 @@ def act(x: torch.Tensor, site: str) -> torch.Tensor:
 
 
 def kv(attention, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """k and v of one layer, each [tokens, heads * head_dim], rounded per token and head."""
+    """k and v of one layer, each [tokens, heads * head_dim], rounded per token and head (or per KV_GROUP values)."""
     if not KV_BITS or k.numel() == 0:
         return k, v
     _note("kv", k)
-    head_dim = attention.head_dim
-    return (
-        round_last_dim(k.reshape(-1, head_dim), KV_BITS).reshape(k.shape),
-        round_last_dim(v.reshape(-1, head_dim), KV_BITS).reshape(v.shape),
-    )
+    group = KV_GROUP or attention.head_dim
+    assert attention.head_dim % group == 0, f"{KV_GROUP_ENV_VAR}={group} does not divide head_dim {attention.head_dim}"
+    if K_BITS:
+        k = round_last_dim(k.reshape(-1, group), K_BITS).reshape(k.shape)
+    if V_BITS:
+        v = round_last_dim(v.reshape(-1, group), V_BITS).reshape(v.shape)
+    return k, v
