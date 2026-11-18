@@ -7,9 +7,20 @@ import torch.distributed as dist
 logger = logging.getLogger(__name__)
 
 
-def clear_memory(clear_host_memory: bool = False):
+_frozen_long_lived_objects = False
+
+
+def clear_memory(clear_host_memory: bool = False, freeze_long_lived_objects: bool = False):
+    """freeze_long_lived_objects: after this call's collection, take every object alive now out of later
+    collections (gc.freeze). A process that calls this every step otherwise walks its whole heap each time: the
+    model, the optimizer and the parallel state are tens of millions of objects and none of them is garbage.
+    Objects created afterwards are collected as before."""
+    global _frozen_long_lived_objects
     torch.accelerator.synchronize()
     gc.collect()
+    if freeze_long_lived_objects and not _frozen_long_lived_objects:
+        gc.freeze()
+        _frozen_long_lived_objects = True
     torch.accelerator.empty_cache()
     if clear_host_memory:
         torch._C._host_emptyCache()

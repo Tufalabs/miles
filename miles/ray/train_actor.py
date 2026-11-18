@@ -285,7 +285,7 @@ class TrainRayActor(NodeProbeMixin):
 
     def clear_memory(self) -> None:
         print_memory("before TrainRayActor.clear_memory")
-        clear_memory()
+        clear_memory(freeze_long_lived_objects=True)
         print_memory("after TrainRayActor.clear_memory")
 
     @abc.abstractmethod
