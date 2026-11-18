@@ -192,6 +192,10 @@ class UpdateWeightFromTensor(WeightTransferProtocol):
         if self._ipc_gather_group is not None:
             dist.barrier(group=self._ipc_gather_group)
         del long_lived_tensors
+        # A shared bucket stays allocated until its receiver has let go of it and this process collects it. Without
+        # a collection here every bucket of an update is a fresh allocation that lives to the update's end, a full
+        # copy of the engine's weights in temporaries; with it the next buckets reuse the blocks.
+        torch.cuda.ipc_collect()
 
     def after_engines_resumed(self) -> None:
         torch.cuda.ipc_collect()
