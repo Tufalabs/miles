@@ -10,7 +10,7 @@ from .kimi_vl import convert_kimi_k25_to_hf, convert_kimivl_to_hf
 from .llama import convert_llama_to_hf
 from .mimo import convert_mimo_to_hf
 from .minimax_m3 import convert_minimax_m3_to_hf
-from .processors import quantize_params, remove_padding
+from .processors import quantize_params, quantize_stacked_expert_params, remove_padding
 from .qwen2 import convert_qwen2_to_hf
 from .qwen3_5 import convert_qwen3_5_to_hf
 from .qwen3_8_next import convert_qwen3_8_next_to_hf
@@ -33,6 +33,17 @@ def convert_to_hf(args, model_name, name, param, quantization_config=None, packe
     converted_named_tensors = fold_v_scale(_convert_to_hf_core(args, model_name, name, param))
 
     return quantize_params(args, name, converted_named_tensors, quantization_config, packed_weight_basenames)
+
+
+def convert_stacked_experts_to_hf(args, model_name, name, stacked, quantization_config=None):
+    """convert_to_hf for the same matrix of several routed experts: `stacked` is [experts, rows, cols] and `name`
+    the first expert's Megatron name. Returns [(the first expert's HF name, stacked tensor)] in convert_to_hf's
+    order, or None when the quantization has no stacked form. The converters split and reshape along the matrix's
+    own dims, so they run with the experts moved to the last dim."""
+    param = remove_padding(name, stacked.movedim(0, -1), args.backend.vocab_size)
+    converted = fold_v_scale(_convert_to_hf_core(args, model_name, name, param))
+    converted = [(hf_name, tensor.movedim(-1, 0)) for hf_name, tensor in converted]
+    return quantize_stacked_expert_params(args, name, converted, quantization_config)
 
 
 # TODO optimize code details

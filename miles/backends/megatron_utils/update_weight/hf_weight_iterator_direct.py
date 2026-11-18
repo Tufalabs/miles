@@ -1,4 +1,6 @@
 import itertools
+import logging
+import os
 import re
 from argparse import Namespace
 from collections.abc import Sequence
@@ -9,7 +11,7 @@ import torch.distributed as dist
 from tqdm import tqdm
 
 from miles.backends.megatron_utils.lora.native import export_lora_hf_named
-from miles.backends.megatron_utils.megatron_to_hf import convert_to_hf
+from miles.backends.megatron_utils.megatron_to_hf import convert_stacked_experts_to_hf, convert_to_hf
 from miles.backends.megatron_utils.named_weights import named_params_and_buffers
 from miles.backends.megatron_utils.sglang import monkey_patch_torch_reductions
 from miles.backends.megatron_utils.update_weight.expert_gather import ExpertGather
@@ -24,11 +26,32 @@ from miles.utils.test_utils.fault_injector.controller import reach_fault_hook
 from miles.utils.test_utils.fault_injector.models import FaultHookName
 from miles.utils.types import ParamInfo
 
+logger = logging.getLogger(__name__)
+
+# MILES_WEIGHT_SYNC_STACK_EXPERTS=0 converts and quantizes every routed expert matrix by itself, as before.
+_STACK_EXPERTS = os.environ.get("MILES_WEIGHT_SYNC_STACK_EXPERTS", "1") != "0"
+_GROUPED_EXPERT_WEIGHT = re.compile(r"^(.*\.weight)(\d+)$")
+_HF_EXPERT_ID = re.compile(r"\.experts\.(\d+)\.")
+
 
 @dataclass(frozen=True)
 class _ExpertBatch:
     param_infos: Sequence[ParamInfo]
     gathers: tuple[ExpertGather, ...]
+    # The stacked wire format has other units than the per-expert one, and a gather keeps one layout for life.
+    stacked_gathers: tuple[ExpertGather, ...] = ()
+
+
+@dataclass(frozen=True)
+class _StackedExpertPlan:
+    """How one matrix of the experts of a batch (ascending expert id) leaves the stacked conversion."""
+
+    # per expert, the HF names of its unit as the per-expert conversion gives them
+    unit_names: tuple[tuple[str, ...], ...]
+    # (first, stop, names): experts [first, stop) of the stack go out as one unit of tensors [stop - first, ...]
+    # under names whose expert id is "<first id>-<last id>"; a run of one expert keeps its own names and shape.
+    # None when the HF names do not carry the expert id in the expected place.
+    stacked_units: tuple[tuple[int, int, tuple[str, ...]], ...] | None
 
 
 class HfWeightIteratorDirect(MegatronHfWeightIteratorBase):
@@ -39,6 +62,12 @@ class HfWeightIteratorDirect(MegatronHfWeightIteratorBase):
         super().__init__(*args, **kwargs)
         parallel = get_parallel_state()
         self._convert_experts_before_gather = parallel.etp.size == 1
+        # Set by the weight updater when the receiver takes tensors of several experts stacked along dim 0 under
+        # names "...experts.<first>-<last>...." (see send_stacked_experts on the transfer protocol).
+        self.send_stacked_experts = False
+        # One conversion and one quantization call for all the experts a batch holds of a layer matrix.
+        self.stack_experts = _STACK_EXPERTS
+        self._stacked_expert_plans: dict[tuple[str, ...], _StackedExpertPlan | None] = {}
         non_expert_infos, expert_infos = _get_megatron_local_param_infos(
             self.args, self.model, gather_pp=self.placement.gather_pp
         )
@@ -73,6 +102,7 @@ class HfWeightIteratorDirect(MegatronHfWeightIteratorBase):
                 _ExpertBatch(
                     param_infos=batches[edp.rank],
                     gathers=tuple(ExpertGather(group=group.group) for group in groups if group.size > 1),
+                    stacked_gathers=tuple(ExpertGather(group=group.group) for group in groups if group.size > 1),
                 )
                 for batches in itertools.zip_longest(*owner_batches, fillvalue=())
             ]
@@ -122,10 +152,96 @@ class HfWeightIteratorDirect(MegatronHfWeightIteratorBase):
             for info in batch.param_infos
             if info.src_rank == rank
         )
-        units = list(self._convert_to_hf_param_units(local_params))
-        for gather in batch.gathers:
+        if self.stack_experts:
+            units = self._convert_expert_units_stacked(list(local_params))
+        else:
+            units = list(self._convert_to_hf_param_units(local_params))
+        for gather in batch.stacked_gathers if self.send_stacked_experts else batch.gathers:
             units = gather(units, device=device)
         return units
+
+    def _convert_expert_units_stacked(self, named_params: list[tuple[str, torch.Tensor]]):
+        """The units of _convert_to_hf_param_units, computed with one conversion and one quantization call for all
+        the experts a batch holds of a layer matrix. With send_stacked_experts off the result is the per-expert
+        one, name for name and byte for byte; with it on, each run of consecutive experts is one unit."""
+        groups: dict[str, list[int]] = {}
+        for index, (name, _param) in enumerate(named_params):
+            match = _GROUPED_EXPERT_WEIGHT.match(name)
+            groups.setdefault(match.group(1) if match else name, []).append(index)
+
+        units_of_param: list = [None] * len(named_params)
+        units_of_group: list = []
+        for indices in groups.values():
+            # ascending expert id, so that consecutive experts are consecutive in the stack
+            indices = sorted(
+                indices, key=lambda index: int(_GROUPED_EXPERT_WEIGHT.match(named_params[index][0]).group(2))
+            )
+            members = [named_params[index] for index in indices]
+            stacked_units, member_units = self._convert_expert_group(members)
+            units_of_group.append(stacked_units)
+            for index, unit in zip(indices, member_units, strict=True):
+                units_of_param[index] = unit
+        if self.send_stacked_experts:
+            return [unit for units in units_of_group for unit in units]
+        return units_of_param
+
+    def _convert_expert_group(self, members: list[tuple[str, torch.Tensor]]):
+        """(units in the stacked wire format, one unit per expert) of one layer matrix's experts. The second is
+        lazy: only the format in use is materialized."""
+        names = tuple(name for name, _param in members)
+        known = names in self._stacked_expert_plans
+        plan = self._stacked_expert_plans.get(names)
+        stackable = (
+            len(members) > 1
+            and (plan is not None or not known)
+            and all(_GROUPED_EXPERT_WEIGHT.match(name) for name in names)
+            and all(param.dim() == 2 and param.shape == members[0][1].shape for _name, param in members)
+        )
+        if not stackable:
+            units = list(self._convert_to_hf_param_units(members))
+            return units, units
+
+        try:
+            stacked = convert_stacked_experts_to_hf(
+                self.args,
+                self.model_name,
+                names[0],
+                torch.stack([param for _name, param in members]),
+                self.quantization_config,
+            )
+        except Exception:
+            if known:
+                raise
+            logger.warning("No stacked conversion for %s; converting its experts one by one", names[0], exc_info=True)
+            stacked = None
+        if stacked is None:
+            assert not known, f"The stacked conversion of {names[0]} stopped working"
+            self._stacked_expert_plans[names] = None
+            units = list(self._convert_to_hf_param_units(members))
+            return units, units
+
+        if plan is None:
+            # First sight of this group: the per-expert conversion gives the names, and the stacked result has to
+            # equal it in every byte before anything is sent.
+            reference = list(self._convert_to_hf_param_units(members))
+            plan = _build_stacked_expert_plan(names, reference, stacked)
+            self._stacked_expert_plans[names] = plan
+
+        tensors = [tensor for _name, tensor in stacked]
+        if not self.send_stacked_experts or plan.stacked_units is None:
+            units = [
+                [(name, tensor[expert]) for name, tensor in zip(unit_names, tensors, strict=True)]
+                for expert, unit_names in enumerate(plan.unit_names)
+            ]
+            return units, units
+        stacked_units = [
+            [
+                (name, tensor[first] if stop - first == 1 else tensor[first:stop])
+                for name, tensor in zip(unit_names, tensors, strict=True)
+            ]
+            for first, stop, unit_names in plan.stacked_units
+        ]
+        return stacked_units, [None] * len(members)
 
     def _export_pp_local_lora(self, adapter):
         assert adapter is None, "multi-LoRA export requires --megatron-to-hf-mode bridge"
@@ -138,6 +254,63 @@ class HfWeightIteratorDirect(MegatronHfWeightIteratorBase):
                     self.args, self.model_name, name, param, self.quantization_config, self.packed_weight_basenames
                 )
             )
+
+
+def _same_bytes(a: torch.Tensor, b: torch.Tensor) -> bool:
+    return (
+        a.shape == b.shape
+        and a.dtype == b.dtype
+        and bool(torch.equal(a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8)))
+    )
+
+
+def _build_stacked_expert_plan(
+    megatron_names: tuple[str, ...],
+    reference: list[list[tuple[str, torch.Tensor]]],
+    stacked: list[tuple[str, torch.Tensor]],
+) -> _StackedExpertPlan:
+    """Check the stacked conversion of a group against its per-expert conversion, byte for byte, and derive the
+    names of both wire formats from the per-expert names."""
+    for expert, unit in enumerate(reference):
+        assert len(unit) == len(
+            stacked
+        ), f"{megatron_names[expert]}: {len(unit)} tensors per expert, {len(stacked)} from the stacked conversion"
+    for position, (first_name, tensor) in enumerate(stacked):
+        assert reference[0][position][0] == first_name, f"{reference[0][position][0]} != {first_name}"
+        expected = torch.stack([unit[position][1] for unit in reference])
+        if not _same_bytes(tensor, expected):
+            raise RuntimeError(
+                f"Stacked conversion of {first_name} ({len(reference)} experts from {megatron_names[0]}) differs from "
+                f"the per-expert conversion: {tuple(tensor.shape)} {tensor.dtype} vs {tuple(expected.shape)} "
+                f"{expected.dtype}. Set MILES_WEIGHT_SYNC_STACK_EXPERTS=0 to convert per expert."
+            )
+
+    unit_names = tuple(tuple(name for name, _tensor in unit) for unit in reference)
+    # The expert id of each unit, read from its HF names; all tensors of a unit must agree on it.
+    expert_ids = []
+    for names in unit_names:
+        ids = {tuple(_HF_EXPERT_ID.findall(name)) for name in names}
+        if len(ids) != 1 or len(next(iter(ids))) != 1:
+            return _StackedExpertPlan(unit_names=unit_names, stacked_units=None)
+        expert_ids.append(int(next(iter(ids))[0]))
+
+    stacked_units = []
+    first = 0
+    for stop in range(1, len(expert_ids) + 1):
+        if stop < len(expert_ids) and expert_ids[stop] == expert_ids[stop - 1] + 1:
+            continue
+        if stop - first == 1:
+            names = unit_names[first]
+        else:
+            span = f".experts.{expert_ids[first]}-{expert_ids[stop - 1]}."
+            names = tuple(_HF_EXPERT_ID.sub(span, name) for name in unit_names[first])
+            # every expert of the run must have the first one's names up to the expert id
+            for expert in range(first, stop):
+                if tuple(_HF_EXPERT_ID.sub(span, name) for name in unit_names[expert]) != names:
+                    return _StackedExpertPlan(unit_names=unit_names, stacked_units=None)
+        stacked_units.append((first, stop, names))
+        first = stop
+    return _StackedExpertPlan(unit_names=unit_names, stacked_units=tuple(stacked_units))
 
 
 def _load_or_allocate_params(param_infos: Sequence[ParamInfo], megatron_local_weights) -> list[torch.Tensor]:

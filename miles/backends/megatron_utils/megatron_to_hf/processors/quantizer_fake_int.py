@@ -76,3 +76,17 @@ def change_params(converted_named_params):
                 )
         changed.append((name, weight))
     return changed
+
+
+def change_stacked_params(converted_named_params):
+    """change_params for tensors that hold the same matrix of several experts stacked along dim 0, each under the
+    first expert's name. Rounding works on rows, so the stacked tensor is rounded in one call. None with noise on:
+    the offset is drawn per matrix from its name."""
+    if _NOISE:
+        return None
+    changed = []
+    for name, weight in converted_named_params:
+        if weight.dim() == 3 and _MATRIX.search(name):
+            weight = round_rows(weight, _BITS)
+        changed.append((name, weight))
+    return changed

@@ -124,6 +124,70 @@ def quantize_params_fp8(args, megatron_name, converted_named_params, quantizatio
     return converted_named_params
 
 
+_ROUTED_EXPERT_NAME = re.compile(
+    r"module\.module\.decoder\.layers\.(\d+)\.mlp\.experts\.(linear_fc1|linear_fc2)\.weight(\d+)$"
+)
+
+
+def quantize_stacked_expert_params_fp8(args, megatron_name, converted_named_params, quantization_config):
+    """quantize_params_fp8 for one matrix of several routed experts at once: every tensor holds the experts
+    stacked along dim 0 under the first expert's name, and so does every returned tensor. One block-cast call
+    replaces one per expert. None when this configuration has no stacked form; the caller then quantizes per
+    expert."""
+    assert quantization_config["quant_method"] == "fp8"
+    fmt = quantization_config.get("fmt", "e4m3")
+    assert fmt == "e4m3", f"Unsupported FP8 format: {fmt}"
+    assert quantization_config["activation_scheme"] == "dynamic"
+    if _ROUTED_EXPERT_NAME.match(megatron_name) is None:
+        return None
+    weight_block_size = quantization_config.get("weight_block_size", None)
+    is_skipped = _build_layer_skip_predicate(
+        tuple(quantization_config.get("ignored_layers", quantization_config.get("modules_to_not_convert", [])) or []),
+        tuple(
+            (name, tuple(members))
+            for name, members in (quantization_config.get("packed_modules_mapping") or {}).items()
+        ),
+    )
+    quantized = []
+    for name, stacked in converted_named_params:
+        # the per-expert path drops these too
+        if name.endswith("_scale"):
+            continue
+        result = _quantize_stacked_param(args, name, stacked, weight_block_size, is_skipped)
+        if result is None:
+            return None
+        quantized.extend(result)
+    return quantized
+
+
+def _quantize_stacked_param(args, name, stacked, weight_block_size, is_skipped):
+    """_quantize_param's 128x128 block cast on [experts, rows, cols]. The cast works on blocks of 128 rows, so with
+    rows a multiple of 128 no block spans two experts and the stacked call computes each expert's blocks from the
+    same values as a call per expert."""
+    assert name.endswith(".weight"), f"Expected weight parameter, got {name}"
+    prefix = name.removesuffix(".weight")
+    if ".experts." in prefix:
+        prefix = prefix.split(".experts.", 1)[0] + ".experts"
+    if is_skipped(prefix):
+        return [(name, stacked)]
+    if (
+        stacked.dim() != 3
+        or weight_block_size is None
+        or list(weight_block_size) != [128, 128]
+        or stacked.shape[1] % 128 != 0
+        or _get_scale_format(args, name, weight_block_size) == "ue8m0"
+        or os.environ["NVTE_FP8_BLOCK_SCALING_FP32_SCALES"] != "0"
+        or per_block_cast_to_fp8 is None
+    ):
+        return None
+    num_experts, rows, cols = stacked.shape
+    qweight, scale = per_block_cast_to_fp8(stacked.reshape(num_experts * rows, cols))
+    return [
+        (name, qweight.view(num_experts, rows, cols)),
+        (name.replace(".weight", ".weight_scale_inv"), scale.view(num_experts, rows // 128, scale.shape[-1])),
+    ]
+
+
 @functools.lru_cache(maxsize=8)
 def _build_layer_skip_predicate(
     ignored_names: tuple[str, ...], packed_modules_mapping: tuple[tuple[str, tuple[str, ...]], ...]
