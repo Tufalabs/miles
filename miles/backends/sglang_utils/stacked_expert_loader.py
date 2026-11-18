@@ -11,9 +11,9 @@ of the update request, so it imports nothing of miles. The request carries one f
 dtypes, shapes and byte ranges travel in the name of that tensor (BUCKET_NAME_PREFIX + base64 JSON), because the
 request format of a custom loader is a list of (name, tensor).
 
-What a stacked tensor is written to is decided by SGLang's code, not here: the model's load_weights resolves the
-first and the last expert's name to a parameter, a shard and an expert slot (its calls to the MoE layer's
-weight_loader are recorded, not executed), and the copy itself is the layer's own _load_w13 / _load_w2 on the
+What a stacked tensor is written to is decided by SGLang's code, not here: the model's load_weights resolves
+every expert's name to a parameter, a shard and a local expert slot (its calls to the MoE layer's
+_weight_loader_impl are recorded, not executed), and the copy itself is the layer's own _load_w13 / _load_w2 on the
 slots' slice. Layers, quantization methods and tensors outside the cases handled below go to load_weights one expert
 at a time, as before.
 
@@ -156,93 +156,95 @@ def _load_stacked(model, named_tensors) -> None:
 
 
 def _resolve_targets(model, named_tensors) -> dict:
-    """Ask the model's load_weights where the first and the last expert of each stacked tensor go, by recording its
-    calls to the MoE layers' weight_loader instead of executing them."""
+    """Ask the model's load_weights where every expert of each stacked tensor goes: its calls reach the MoE layers'
+    _weight_loader_impl with the parameter, the shard and the local expert slot (after the expert-location and
+    rank mapping), and those calls are recorded instead of executed."""
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
-    loaders = []
+    layers = {}
     for _param_name, param in model.named_parameters():
-        loader = getattr(param, "weight_loader", None)
-        if isinstance(getattr(loader, "__self__", None), FusedMoE):
-            loaders.append((param, loader))
+        layer = getattr(getattr(param, "weight_loader", None), "__self__", None)
+        if isinstance(layer, FusedMoE):
+            layers[id(layer)] = layer
 
     probes = []
     probe_of = {}
     for name, tensor in named_tensors:
         match = _STACKED_NAME.search(name)
-        for expert_id in (int(match.group(1)), int(match.group(2))):
-            probe = tensor[0]
-            probes.append((_expert_name(name, match, expert_id), probe))
-            probe_of[id(probe)] = (name, expert_id)
-            probe_of[(name, expert_id)] = probe  # keeps the probe alive, so its id stays its own
+        first, last = int(match.group(1)), int(match.group(2))
+        for offset in range(min(tensor.shape[0], last - first + 1)):
+            probe = tensor[offset]
+            probes.append((_expert_name(name, match, first + offset), probe))  # also keeps the probe's id its own
+            probe_of[id(probe)] = (name, offset)
 
-    records: dict[tuple[str, int], tuple] = {}
+    records: dict[tuple[str, int], list] = {}
 
-    def recorder_for(param, loader):
-        def record(recorded_param, loaded_weight, weight_name, shard_id, expert_id):
+    def recorder_for(layer):
+        def record(param, loaded_weight, weight_name, shard_id, expert_id):
             key = probe_of.get(id(loaded_weight))
-            assert key is not None and recorded_param is param, f"unexpected load of {weight_name}"
-            assert key not in records, f"{key} loaded twice"
-            records[key] = (param, loader.__self__, weight_name, shard_id, expert_id)
+            assert key is not None, f"unexpected load of {weight_name}"
+            records.setdefault(key, []).append((param, layer, weight_name, shard_id, expert_id))
 
         return record
 
     try:
-        for param, loader in loaders:
-            param.weight_loader = recorder_for(param, loader)
+        for layer in layers.values():
+            layer._weight_loader_impl = recorder_for(layer)
         model.load_weights(probes)
     finally:
-        for param, loader in loaders:
-            param.weight_loader = loader
+        for layer in layers.values():
+            del layer._weight_loader_impl
 
     targets = {}
+    reasons: dict[str, str] = {}
     for name, tensor in named_tensors:
         match = _STACKED_NAME.search(name)
-        first, last = int(match.group(1)), int(match.group(2))
-        targets[name] = _target_of(
-            name, tensor, records.get((name, first)), records.get((name, last)), last - first + 1
-        )
+        count = int(match.group(2)) - int(match.group(1)) + 1
+        target = _target_of(tensor, [records.get((name, offset)) for offset in range(count)])
+        if isinstance(target, str):
+            reasons.setdefault(target, name)
+            target = None
+        targets[name] = target
+    for reason, name in reasons.items():
+        logger.warning("stacked expert loader: %s goes through load_weights: %s", name, reason)
     return targets
 
 
-def _target_of(name, tensor, first_record, last_record, count):
-    """The target of a stacked tensor, or None when it is outside what _write_stacked reproduces."""
+def _target_of(tensor, records):
+    """The target of a stacked tensor, or the reason why it is outside what _write_stacked reproduces."""
     from sglang.srt.layers.moe.fused_moe_triton import layer as moe
 
-    if first_record is None or last_record is None or tensor.shape[0] != count:
-        return None
-    param, layer, param_name, shard_id, first_id = first_record
-    if last_record[0] is not param or last_record[2] != param_name or last_record[3] != shard_id:
-        return None
-    last_id = last_record[4]
-
-    # FusedMoE.weight_loader
-    if first_id is None or (layer.uses_expert_location and moe.get_global_expert_location_metadata() is not None):
-        return None
-    if getattr(param, "_sglang_require_global_experts", False):
-        return None
-    slot = layer._map_global_expert_id_to_local_expert_id(first_id)
-    last_slot = layer._map_global_expert_id_to_local_expert_id(last_id)
-    if slot < 0 or last_slot != slot + count - 1:
-        return None
+    if tensor.shape[0] != len(records):
+        return f"{tensor.shape[0]} experts in the tensor, {len(records)} in its name"
+    if any(record is None or len(record) != 1 for record in records):
+        counts = sorted({0 if record is None else len(record) for record in records})
+        return f"load_weights writes an expert to {counts} slots of this engine"
+    param, layer, param_name, shard_id, slot = records[0][0]
+    for offset, ((other_param, _layer, other_name, other_shard, other_slot),) in enumerate(records):
+        if other_param is not param or other_name != param_name or other_shard != shard_id:
+            return "the experts go to different parameters"
+        if other_slot != slot + offset:
+            return "the experts' slots are not consecutive"
 
     # FusedMoE._weight_loader_impl: only the plain weight and block-scale cases
     method = _layout_method(layer)
     if type(method) not in (moe.Fp8MoEMethod, moe.UnquantizedFusedMoEMethod):
-        return None
+        return f"quantization method {type(method).__name__}"
     if getattr(param, "is_gguf_weight", False) or getattr(param, "is_gguf_weight_type", False):
-        return None
-    if layer._has_fused_shared or shard_id not in ("w1", "w2", "w3"):
-        return None
+        return "GGUF weight"
+    if layer._has_fused_shared:
+        return "fused shared experts"
+    if shard_id not in ("w1", "w2", "w3"):
+        return f"shard {shard_id}"
     if any(key in param_name for key in ("input_scale", "g_idx", "zero", "offset", "weight_shape", "bias")):
-        return None
+        return f"parameter kind of {param_name}"
     if "scale" in param_name:
         block_scales = (moe.FusedMoeWeightScaleSupported.GROUP.value, moe.FusedMoeWeightScaleSupported.BLOCK.value)
         if getattr(param, "quant_method", None) not in block_scales:
-            return None
+            return f"scale kind {getattr(param, 'quant_method', None)}"
     elif "weight" not in param_name:
-        return None
-    return _Target(param, layer, param_name, shard_id, slot, count)
+        return f"parameter kind of {param_name}"
+    return _Target(param, layer, param_name, shard_id, slot, len(records))
 
 
 def _layout_method(layer):
