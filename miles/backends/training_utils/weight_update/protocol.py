@@ -30,6 +30,9 @@ class WeightTransferProtocol(ABC):
     supports_receiver_pools: ClassVar[bool] = False
     use_weight_update_session: ClassVar[bool] = True
     needs_base_resync_for_lora: bool = False
+    # Set by connect(): the receivers take the routed experts of a layer matrix as one stacked tensor (see
+    # --update-weight-stacked-experts), so the updater asks its iterator for that format.
+    send_stacked_experts: bool = False
 
     def __init__(self, args: Namespace) -> None:
         self.args = args

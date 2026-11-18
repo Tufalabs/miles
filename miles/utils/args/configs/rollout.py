@@ -177,6 +177,27 @@ class RolloutRelatedConfig(BaseConfig):
         512 * 1024**2
     )
     update_weights_interval: A[int, Arg(help="Interval for updating the weights")] = 1
+    update_weight_stacked_experts: A[
+        bool,
+        Arg(
+            help=(
+                "Colocated weight updates send the routed experts of a layer matrix as one tensor "
+                "[experts, rows, cols] instead of one tensor per expert, and the engines load it with one copy "
+                "(miles.backends.sglang_utils.stacked_expert_loader, registered as an SGLang custom weight "
+                "loader). The engines end up with the same bytes; the first update checks that in every engine."
+            )
+        ),
+    ] = False
+    update_weight_keep_cuda_cache: A[
+        bool,
+        Arg(
+            help=(
+                "Colocated weight updates leave the trainer's CUDA allocator cache in place afterwards instead "
+                "of returning it to the driver, so the next update reuses the blocks. Costs the update's "
+                "temporaries (about twice --update-weight-buffer-size) in reserved memory between updates."
+            )
+        ),
+    ] = False
     pause_generation_mode: A[
         str,
         Arg(

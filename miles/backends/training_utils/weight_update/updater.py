@@ -7,7 +7,9 @@ LoRA adapter pushes.
 """
 
 import logging
+import os
 import random
+import time
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING
@@ -43,6 +45,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# MILES_WEIGHT_SYNC_REFERENCE_CHECK=1: the first update sends the weights twice, first the way they were sent before
+# stacked experts existed (one tensor per expert, converted and quantized one by one), then the configured way with
+# the engines' parameters overwritten by random values in between, and requires the SHA-256 of every engine
+# parameter to be the same after both. Costs two updates and two hashes of all weights, once.
+_REFERENCE_CHECK = os.environ.get("MILES_WEIGHT_SYNC_REFERENCE_CHECK", "0") == "1"
+
 
 class WeightUpdater:
     def __init__(
@@ -65,13 +73,15 @@ class WeightUpdater:
         assert (
             not is_lora or self.protocol.supports_lora
         ), f"LoRA weight sync is not supported for {args.update_weight_transfer_mode!r} weight transfer."
-        self._hf_weight_iterator = iterator_factory(
+        self._build_iterator = lambda: iterator_factory(
             args,
             model,
             required_placement=self.protocol.required_placement,
             model_name=model_name,
             quantization_config=quantization_config,
         )
+        self._hf_weight_iterator = self._build_iterator()
+        self._reference_checked = False
         self.weights_getter = weights_getter
         self.is_lora = is_lora
         if is_lora:
@@ -106,6 +116,7 @@ class WeightUpdater:
             ),
         )
         assert self.protocol.is_sender is not None, "connect() must set is_sender"
+        self._hf_weight_iterator.send_stacked_experts = self.protocol.send_stacked_experts
         self._registered_adapters.clear()
 
     def reconnect_if_needed(self, info: "UpdatableEngines") -> bool:
@@ -167,21 +178,14 @@ class WeightUpdater:
             assert (
                 self._hf_weight_iterator.placement.gather_pp
             ), "the LoRA checksum manifest is recorded on one rank, which must hold the full adapter"
+        reference_check = _REFERENCE_CHECK and not self._reference_checked and sync_base and not adapters
         with timer("update_weights_implementation"):
-            pbar = tqdm(desc=f"[{protocol.group_name}] Update weights", total=0) if protocol.is_sender else None
-            for bucket in self._hf_weight_iterator.iter_hf_weights(
-                self.weights_getter(),
-                include_base=sync_base,
-                adapters=adapters,
-                materialize=protocol.is_sender,
-            ):
-                if protocol.is_sender:
-                    if driver and checksums is not None:
-                        record_lora_checksums(bucket, checksums)
-                    protocol.send_bucket(bucket)
-                    pbar.update(1)
-            protocol.after_base_weights()
-            dist.barrier(group=get_gloo_group())
+            if reference_check:
+                self._reference_checked = True
+                reference_checksums = self._send_reference_weights(driver)
+            self._send_weights(self._hf_weight_iterator, sync_base, adapters, checksums, driver)
+            if reference_check and driver:
+                _require_same_checksums(reference_checksums, self._engine_parameter_checksums())
 
         with timer("finalize_and_resume_engines"):
             protocol.finalize(weight_version)
@@ -194,6 +198,81 @@ class WeightUpdater:
             dist.barrier(group=get_gloo_group())
         protocol.after_engines_resumed()
         return True
+
+    def _send_weights(self, iterator, sync_base: bool, adapters, checksums, driver: bool) -> None:
+        protocol = self.protocol
+        pbar = tqdm(desc=f"[{protocol.group_name}] Update weights", total=0) if protocol.is_sender else None
+        started = time.perf_counter()
+        num_buckets = num_tensors = num_bytes = 0
+        send_seconds = 0.0
+        for bucket in iterator.iter_hf_weights(
+            self.weights_getter(),
+            include_base=sync_base,
+            adapters=adapters,
+            materialize=protocol.is_sender,
+        ):
+            if protocol.is_sender:
+                if driver and checksums is not None:
+                    record_lora_checksums(bucket, checksums)
+                send_started = time.perf_counter()
+                protocol.send_bucket(bucket)
+                send_seconds += time.perf_counter() - send_started
+                num_buckets += 1
+                num_tensors += len(bucket)
+                num_bytes += sum(tensor.nbytes for _name, tensor in bucket)
+                pbar.update(1)
+        protocol.after_base_weights()
+        dist.barrier(group=get_gloo_group())
+        if driver and num_buckets:
+            # send = serialize, hand over and wait for the receiver to load; the rest is reading, converting,
+            # quantizing and gathering on the trainer.
+            total = time.perf_counter() - started
+            logger.info(
+                f"weight update stream: {num_buckets} buckets, {num_tensors} tensors, {num_bytes / 2**30:.2f} GiB, "
+                f"{total:.3f} s = {total - send_seconds:.3f} s produce + {send_seconds:.3f} s send"
+            )
+
+    def _send_reference_weights(self, driver: bool) -> list | None:
+        """MILES_WEIGHT_SYNC_REFERENCE_CHECK: send the weights one tensor per expert, each converted and quantized by
+        itself, hash what the engines hold, and overwrite their parameters with random values, so that the update
+        that follows has to write every byte again. Collective: every rank sends."""
+        protocol = self.protocol
+        reference_iterator = self._build_iterator()
+        reference_iterator.stack_experts = False
+        send_stacked_experts, protocol.send_stacked_experts = protocol.send_stacked_experts, False
+        try:
+            self._send_weights(reference_iterator, True, [], None, driver)
+        finally:
+            protocol.send_stacked_experts = send_stacked_experts
+        reference_checksums = None
+        if driver:
+            reference_checksums = self._engine_parameter_checksums()
+            selector = weight_update_selector(
+                speculative_algorithm=self.args.sglang.base_args["speculative_algorithm"],
+                enable_mtp_training=self.args.enable_mtp_training,
+            )
+            self._check_weights_on_engines({"action": "reset_tensors", "selector": selector})
+        dist.barrier(group=get_gloo_group())
+        return reference_checksums
+
+    def _engine_parameter_checksums(self) -> list:
+        """Per engine and rank, {parameter name: SHA-256 of its bytes}."""
+        started = time.perf_counter()
+        responses = self._check_weights_on_engines({"action": "raw_checksum", "selector": "all"})
+        checksums = [[rank["checksums"] for rank in response["ranks"]] for response in responses]
+        logger.info(
+            f"weight sync reference check: SHA-256 of {sum(len(c) for engine in checksums for c in engine)} parameters "
+            f"on {len(checksums)} engines in {time.perf_counter() - started:.1f} s; per engine "
+            f"{[response['per_engine_checksum'][:16] for response in responses]}"
+        )
+        return checksums
+
+    def _check_weights_on_engines(self, payload: dict) -> list:
+        futures = [
+            async_utils.submit(engine._make_request("weights_checker", payload, timeout=3600.0))
+            for engine in self.protocol.rollout_engines
+        ]
+        return async_utils.wait_futures(futures)
 
     def _iter_base_buckets(self, *, materialize: bool):
         return self._hf_weight_iterator.iter_hf_weights(self.weights_getter(), materialize=materialize)
@@ -225,6 +304,26 @@ class WeightUpdater:
                 ),
             )
             self._registered_adapters.add(lora_name)
+
+
+def _require_same_checksums(reference: list, actual: list) -> None:
+    different = [
+        (engine, rank, name)
+        for engine, (reference_ranks, actual_ranks) in enumerate(zip(reference, actual, strict=True))
+        for rank, (expected, got) in enumerate(zip(reference_ranks, actual_ranks, strict=True))
+        for name in sorted(expected.keys() | got.keys())
+        if expected.get(name) != got.get(name)
+    ]
+    count = sum(len(checksums) for ranks in reference for checksums in ranks)
+    if different:
+        raise RuntimeError(
+            f"weight sync reference check: {len(different)} of {count} engine parameters differ from the per-expert "
+            f"update, e.g. {different[:8]}"
+        )
+    logger.info(
+        f"weight sync reference check: all {count} engine parameters have the same SHA-256 after the configured "
+        "update as after the per-expert update"
+    )
 
 
 def _mark_cells_errored_on_any_rank(cell_updaters: Sequence[_RolloutCellUpdater]) -> set[str]:

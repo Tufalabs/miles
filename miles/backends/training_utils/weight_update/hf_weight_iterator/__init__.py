@@ -57,6 +57,9 @@ class HfWeightIteratorBase(ABC):
 
     # Placement this implementation can produce; None means any.
     forced_placement: ClassVar[WeightUpdatePlacement | None] = None
+    # The weight updater turns this on when its receivers load routed experts stacked along dim 0 under names
+    # "...experts.<first>-<last>....". Implementations without a stacked form ignore it. Identical on every rank.
+    send_stacked_experts: bool = False
 
     def __init__(
         self,

@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 from sglang.srt.utils import MultiprocessingSerializer
 
+from miles.backends.sglang_utils import stacked_expert_loader
 from miles.backends.sglang_utils.sglang_api_client import SGLangApiClient
 from miles.backends.training_utils.parallel import ParallelState
 from miles.backends.training_utils.weight_update.hf_weight_iterator import WeightUpdatePlacement
@@ -153,6 +154,12 @@ class UpdateWeightFromTensor(WeightTransferProtocol):
         # collective among the group's members.
         self.is_sender = self._ipc_gather_group is not None
 
+        # The stacked format is read by the custom loader the colocated engines were started with. The NCCL tail
+        # and LoRA buckets go through SGLang's own loaders, which take one tensor per expert.
+        self.send_stacked_experts = (
+            self.args.update_weight_stacked_experts and not self.use_distribute and not lora_rollout_enabled(self.args)
+        )
+
         # Remote engines (use_distribute) keep the base as well. Never true unless
         # args.lora_sync_sends_base, which is all the trainer's host backup reads.
         self.needs_base_resync_for_lora = self.args.lora_sync_sends_base and (
@@ -166,6 +173,7 @@ class UpdateWeightFromTensor(WeightTransferProtocol):
             ipc_gather_src=self._ipc_gather_src,
             ipc_gather_group=self._ipc_gather_group,
             selector=self._selector,
+            stacked_expert_format=self.send_stacked_experts,
         )
         if self.use_distribute and self._is_distributed_src_rank:
             futures_distributed = update_weights_from_distributed(
@@ -187,7 +195,8 @@ class UpdateWeightFromTensor(WeightTransferProtocol):
 
     def after_engines_resumed(self) -> None:
         torch.cuda.ipc_collect()
-        torch.cuda.empty_cache()
+        if not self.args.update_weight_keep_cuda_cache:
+            torch.cuda.empty_cache()
 
 
 def _send_to_colocated_engine(
@@ -197,6 +206,7 @@ def _send_to_colocated_engine(
     ipc_gather_src,
     ipc_gather_group,
     selector: str = "all",
+    stacked_expert_format: bool = False,
 ) -> tuple[list[Future], Any]:
     # Placeholder ranks (GPU slots reserved but no engine) have no gather group.
     # gather_object is only collective among group members, so we skip entirely.
@@ -221,10 +231,19 @@ def _send_to_colocated_engine(
     serialized_tensors: list = []
     for _dtype, named_tensors in converted_named_tensors_by_dtypes.items():
         flattened_tensor_bucket = FlattenedTensorBucket(named_tensors=named_tensors)
-        flattened_tensor_data = {
-            "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
-            "metadata": flattened_tensor_bucket.get_metadata(),
-        }
+        if stacked_expert_format:
+            # A custom loader's request is a list of (name, tensor): the bucket's layout travels in the name.
+            flattened_tensor_data = [
+                (
+                    stacked_expert_loader.encode_bucket_name(flattened_tensor_bucket.get_metadata()),
+                    flattened_tensor_bucket.get_flattened_tensor(),
+                )
+            ]
+        else:
+            flattened_tensor_data = {
+                "flattened_tensor": flattened_tensor_bucket.get_flattened_tensor(),
+                "metadata": flattened_tensor_bucket.get_metadata(),
+            }
         long_live_tensors.append(flattened_tensor_data)
         serialized_tensors.append(MultiprocessingSerializer.serialize(flattened_tensor_data, output_str=True))
 
@@ -243,7 +262,7 @@ def _send_to_colocated_engine(
         for i in range(num_dtypes):
             kwargs = {
                 "serialized_named_tensors": [tensors[i] for tensors in serialized_named_tensors],
-                "load_format": "flattened_bucket",
+                "load_format": stacked_expert_loader.LOAD_FORMAT if stacked_expert_format else "flattened_bucket",
                 "selector": selector,
             }
             futures.append(async_utils.submit(_update_weights_from_tensor_gated(ipc_gate, ipc_engine, kwargs)))

@@ -6,6 +6,7 @@ import shlex
 
 from sglang.srt.server_args import ServerArgs
 
+from miles.backends.sglang_utils import stacked_expert_loader
 from miles.backends.sglang_utils.arguments import sglang_attention_dp_enabled
 from miles.backends.sglang_utils.server_args_utils import server_args_to_argv
 from miles.backends.sglang_utils.sglang_api_client import WorkerType
@@ -129,6 +130,13 @@ def _compute_server_args(
 
     if os.environ.get("MILES_SGLANG_DUMMY_LOAD") == "1":
         kwargs["load_format"] = "dummy"
+
+    if args.update_weight_stacked_experts:
+        # the load format of the trainer's update requests; see cuda_ipc.UpdateWeightFromTensor
+        kwargs["custom_weight_loader"] = [
+            *(base_args.get("custom_weight_loader") or []),
+            stacked_expert_loader.LOAD_FORMAT,
+        ]
 
     if worker_type == WorkerType.PREFILL:
         kwargs["disaggregation_mode"] = WorkerType.PREFILL.value
