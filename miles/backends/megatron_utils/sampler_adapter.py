@@ -44,6 +44,12 @@ MILES_SAMPLER_ADAPTER_WARMUP=<w> (default 0) updates on every one of the first w
 whatever n is: an offset that starts from zero is fitted in tens of updates, which at n = 10 would take
 hundreds of steps.
 
+MILES_SAMPLER_ADAPTER_PLAN=<rollout>:<update 0|1>:<lr>:<wd>:<reset 0|1>,... overrides EVERY, WARMUP, LR and WD
+rollout by rollout, for fitting the offset offline on replayed batches at a frozen policy: a listed rollout
+with update 1 takes the divergence pass and the offset's step at that lr and wd, one with update 0 only uses
+the offset (its logged KL is the KL with the current offset), and reset 1 sets the offset to zero first.
+Rollouts not listed are left alone (no update).
+
 MILES_SAMPLER_ADAPTER_RANK=<r> keeps the offset of every matrix in the group at rank r: after each step the
 offset is replaced by its rank-r approximation (`_truncate`). The q, k and v rows of a linear_qkv weight are
 three matrices, each at rank r. Vectors (norm gains) are left as they are. A low-rank offset holds less of
@@ -89,6 +95,12 @@ assert _EVERY >= 1, f"{EVERY_ENV_VAR}={_EVERY}: expected a positive number of st
 WARMUP_ENV_VAR = "MILES_SAMPLER_ADAPTER_WARMUP"
 _WARMUP = int(os.environ.get(WARMUP_ENV_VAR, "") or 0)
 _first_rollout = None  # the id of the first rollout this process trains on (a resumed run starts later)
+PLAN_ENV_VAR = "MILES_SAMPLER_ADAPTER_PLAN"
+_PLAN: dict[int, tuple[bool, float, float, bool]] = {}
+for _entry in filter(None, (part.strip() for part in os.environ.get(PLAN_ENV_VAR, "").split(","))):
+    _rollout, _update, _lr, _wd, _reset = _entry.split(":")
+    _PLAN[int(_rollout)] = (_update == "1", float(_lr), float(_wd), _reset == "1")
+    assert 0 <= float(_lr) * float(_wd) < 1, f"{PLAN_ENV_VAR}: {_entry}: lr * wd must be in [0, 1)"
 RANK_ENV_VAR = "MILES_SAMPLER_ADAPTER_RANK"
 _RANK = int(os.environ.get(RANK_ENV_VAR, "") or 0)
 assert _RANK >= 0, f"{RANK_ENV_VAR}={_RANK}: expected a rank, or 0 for no limit"
@@ -393,11 +405,18 @@ def measure(
     rate 0, it only adds the offset."""
     if not _ready:
         _collect(model_chunks)
+    plan = _PLAN.get(rollout_id) if _PLAN else None
+    if plan is not None and plan[3]:
+        for entry in _state:
+            entry["offset"].zero_()
     _write(adapted=True)
     global _first_rollout
     if _first_rollout is None:
         _first_rollout = rollout_id
-    if _LR == 0 or (rollout_id % _EVERY != 0 and rollout_id - _first_rollout >= _WARMUP):
+    if _PLAN:
+        if plan is None or not plan[0]:
+            return
+    elif _LR == 0 or (rollout_id % _EVERY != 0 and rollout_id - _first_rollout >= _WARMUP):
         return
     offsets = [iterator.offset for iterator in data_iterator]
     with score_centering_head_kl.divergence_phase():
@@ -416,6 +435,8 @@ def finish(rollout_id: int) -> None:
     """After the policy pass: the sampler's values back in the weights and the offset's step; with
     MILES_SAMPLER_ADAPTER_FREEZE no policy gradient for the group."""
     gradient2, offset2, policy2 = 0.0, 0.0, 0.0
+    plan = _PLAN.get(rollout_id) if _PLAN else None
+    lr, wd = (plan[1], plan[2]) if plan is not None else (_LR, _WD)
     for entry in _state:
         if entry.get("gradient") is not None:
             gradient2 += float(entry["gradient"].square().sum())
@@ -427,7 +448,7 @@ def finish(rollout_id: int) -> None:
             grad[entry["rows"]] = 0
         gradient = entry.pop("gradient", None)  # None: no divergence pass this step
         if gradient is not None:
-            entry["offset"].mul_(1 - _LR * _WD).add_(gradient, alpha=-_LR * scale)
+            entry["offset"].mul_(1 - lr * wd).add_(gradient, alpha=-lr * scale)
             for block in entry.get("blocks", ()):
                 _truncate(block, entry["offset"])
         offset2 += float(entry["offset"].square().sum())
