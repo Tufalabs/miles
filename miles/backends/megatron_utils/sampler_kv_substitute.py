@@ -21,6 +21,7 @@ Needs packed sequences (qkv_format thd), tensor- and context-parallel size 1.
 import hashlib
 import logging
 import os
+import re
 
 import numpy as np
 import torch
@@ -200,7 +201,7 @@ def maybe_install(model_chunks) -> None:
     for chunk in model_chunks:
         for name, module in chunk.named_modules():
             if name.endswith("self_attention") and hasattr(module, "core_attention"):
-                _wrap(module.core_attention, int(name.split(".layers.")[1].split(".")[0]))
+                _wrap(module.core_attention, int(re.search(r"(?:^|\.)layers\.(\d+)\.", name).group(1)))
                 wrapped += 1
     assert wrapped > 0, f"{ENV_VAR} is set but no self_attention.core_attention module was found"
     logger.info("kv substitute installed in %d layers: %s, dumps %s", wrapped, _schedule, _dirs)
