@@ -9,6 +9,10 @@ MILES_MISMATCH_EMULATION=<rollout>:<part>[+<part>...],...  parts:
           128-row blocks, since every head (128 rows) and the 768-row gate and up halves are whole blocks.
   w_int8, w_int4  the same matrices rounded per row to a symmetric 8- or 4-bit grid
           (processors/quantizer_fake_int.round_rows, what MILES_SAMPLER_FAKE_INT_WEIGHTS sends a bf16 engine).
+  a_fp8   the same inputs through SGLang's per-token-group FP8 (groups of 128 along the features, scale = amax / 448
+          with amax floored at 1e-10, values cast to E4M3), straight-through; power-of-two scales (UE8M0, rounded up)
+          on the attention input where the FP8 weights get them (DeepGEMM), fp32 scales on the experts' inputs. The
+          GEMM's own accumulation (FP32 in DeepGEMM and the Triton MoE kernel) is not modelled.
   a_int8  the inputs of linear_proj and of the experts' linear_fc1 and linear_fc2 rounded per token to 8 bits
           (sampler_fake_int.round_last_dim), straight-through. The q/k/v projection's input is normed inside the
           fused layer-norm linear and is not rounded here.
@@ -30,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 ENV_VAR = "MILES_MISMATCH_EMULATION"
 _KEEP = os.environ.get("MILES_SAMPLER_ADAPTER_FORWARD_ONLY", "") == "1"
-PARTS = ("w_fp8", "w_int8", "w_int4", "a_int8")
+PARTS = ("w_fp8", "w_int8", "w_int4", "a_int8", "a_fp8")
 _WEIGHT = re.compile(r"(self_attention\.linear_(qkv|proj)\.weight|mlp\.experts\.linear_fc[12]\.weight\d*)$")
 _ACT_MODULE = re.compile(r"(self_attention\.linear_proj|mlp\.experts\.linear_fc[12])$")
 
@@ -89,7 +93,7 @@ def before_train_step(rollout_id: int) -> None:
         return
     parts = _schedule.get(rollout_id, frozenset())
     weights = next((part for part in parts if part.startswith("w_")), None)
-    _state["act"] = "a_int8" in parts
+    _state["act"] = "int8" if "a_int8" in parts else ("fp8" if "a_fp8" in parts else None)
     if weights is None and _state["weights"] is None:
         return
     if _KEEP and weights == _state["weights"]:
@@ -99,19 +103,35 @@ def before_train_step(rollout_id: int) -> None:
     for (name, param), original in zip(_params, _originals, strict=True):
         param.data.copy_(_quantize(name, original, weights) if weights else original)
     if weights != _state["weights"]:
-        logger.info("mismatch emulation rollout=%d: weights %s, activations %s", rollout_id, weights or "original", "int8" if _state["act"] else "as is")
+        logger.info("mismatch emulation rollout=%d: weights %s, activations %s", rollout_id, weights or "original", _state["act"] or "as is")
     _state["weights"] = weights
 
 
-def _act_hook(module, args):
-    if not _state["act"] or not args or not torch.is_tensor(args[0]):
-        return None
-    x = args[0]
-    top = 127
-    values = x.float()
-    scale = values.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12) / top
-    rounded = (torch.round(values / scale).clamp_(-top, top) * scale).to(x.dtype)
-    return (x + (rounded - x).detach(), *args[1:])
+def _fp8_groups(x: torch.Tensor, ue8m0: bool) -> torch.Tensor:
+    shape = x.shape
+    assert shape[-1] % 128 == 0, f"FP8 activations need features in groups of 128, got {shape[-1]}"
+    groups = x.float().reshape(*shape[:-1], shape[-1] // 128, 128)
+    scale = groups.abs().amax(dim=-1, keepdim=True).clamp_min(1e-10) / 448.0
+    if ue8m0:
+        scale = torch.exp2(torch.ceil(torch.log2(scale)))
+    return ((groups / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).float() * scale).reshape(shape).to(x.dtype)
+
+
+def _act_hook(expert: bool):
+    def hook(module, args):
+        if not _state["act"] or not args or not torch.is_tensor(args[0]):
+            return None
+        x = args[0]
+        if _state["act"] == "fp8":
+            rounded = _fp8_groups(x, ue8m0=not expert and _ue8m0_attention())
+        else:
+            top = 127
+            values = x.float()
+            scale = values.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12) / top
+            rounded = (torch.round(values / scale).clamp_(-top, top) * scale).to(x.dtype)
+        return (x + (rounded - x).detach(), *args[1:])
+
+    return hook
 
 
 def maybe_install(model_chunks) -> None:
@@ -121,6 +141,7 @@ def maybe_install(model_chunks) -> None:
         chosen = frozenset(filter(None, parts.split("+")))
         assert chosen <= set(PARTS), f"{ENV_VAR}: {entry}: parts are {PARTS}"
         assert sum(part.startswith("w_") for part in chosen) <= 1, f"{ENV_VAR}: {entry}: one weight part at most"
+        assert sum(part.startswith("a_") for part in chosen) <= 1, f"{ENV_VAR}: {entry}: one activation part at most"
         _schedule[int(rollout)] = chosen
     if not _schedule:
         return
@@ -132,7 +153,7 @@ def maybe_install(model_chunks) -> None:
                 _params.append((name, param))
         for name, module in chunk.named_modules():
             if _ACT_MODULE.search(name):
-                module.register_forward_pre_hook(_act_hook)
+                module.register_forward_pre_hook(_act_hook(expert=".experts." in name))
                 hooks += 1
     assert _params, f"{ENV_VAR} is set but no attention or expert matrix was found"
     logger.info("mismatch emulation installed: %d matrices, %d activation hooks, schedule %s", len(_params), hooks, {k: sorted(v) for k, v in _schedule.items()})

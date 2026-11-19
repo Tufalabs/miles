@@ -89,7 +89,7 @@ from .freeze_params import maybe_zero_frozen_grads
 from . import sampler_adapter
 from .gain_projection import penalty_gradient, project_out_penalty_gradient
 from .grad_sketch import maybe_save_grad_sketch
-from . import sampler_act_compare, sampler_kv_substitute, sampler_mismatch_emulation
+from . import sampler_act_compare, sampler_kv_substitute, sampler_mismatch_emulation, sampler_residual_adapter
 from .sampler_emulation import maybe_install_sampler_emulation
 from .lora.bridge import _ensure_model_list, _setup_lora_model_via_bridge  # noqa: F401
 
@@ -195,6 +195,7 @@ def setup_model_and_optimizer(
         maybe_install_sampler_emulation(model)
         sampler_kv_substitute.maybe_install(model)
         sampler_mismatch_emulation.maybe_install(model)
+        sampler_residual_adapter.maybe_install(model)  # before the comparison, which then sees corrected outputs
         sampler_act_compare.maybe_install(model)
 
     if args.debug_disable_optimizer:
@@ -525,6 +526,8 @@ def run_forward_backward_pass(
 
         if sampler_kv_substitute.enabled():
             sampler_kv_substitute.set_batch(batch["unconcat_tokens"])
+        if sampler_residual_adapter.enabled():
+            sampler_residual_adapter.set_batch(batch["unconcat_tokens"])
         if sampler_act_compare.enabled():
             sampler_act_compare.set_batch(batch["unconcat_tokens"])
         from miles.utils import routing_flip_stats
