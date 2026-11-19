@@ -18,6 +18,11 @@ to them for its forward passes. Each training step:
      MILES_SAMPLER_ADAPTER_CLIP=<c> scales a step's gradient down to norm c (over all adapted weights) when
      it is larger: an ordinary step has norm 0.1 to 0.4, and the runs that collapsed did so by a few steps
      of norm 5 to 200 that took the offset from 0.4 to 12 (jobs 4978, 5064 and 5058).
+     MILES_SAMPLER_ADAPTER_MAX_NORM=<m> scales the offset back to norm m (over all adapted weights of this
+     rank) after a step that leaves it larger: it bounds where the offset can be, not how fast it moves.
+     Runs that learned well kept the offset at 0.06 to 0.25; the runaway of job 6098 passed 0.76 at its
+     fifth step, and the frozen-sampler run that lost (6169) grew it steadily to 0.45. With tensor
+     parallelism the norm is a shard's; the runs so far are tensor-parallel 1, where every rank holds all.
 
 So the sampler never receives the offset and the policy loss never trains it. The offset is kept in fp32; the
 model's bf16 values during the passes are the rounded sum of the sampler's bf16 values and the offset. It
@@ -75,6 +80,9 @@ assert 0 <= _LR * _WD < 1, f"{WD_ENV_VAR}={_WD} with {LR_ENV_VAR}={_LR}: lr * wd
 CLIP_ENV_VAR = "MILES_SAMPLER_ADAPTER_CLIP"
 _CLIP = float(os.environ.get(CLIP_ENV_VAR, "") or 0.0)
 assert _CLIP >= 0, f"{CLIP_ENV_VAR}={_CLIP}: a norm, 0 for no cap"
+MAX_NORM_ENV_VAR = "MILES_SAMPLER_ADAPTER_MAX_NORM"
+_MAX_NORM = float(os.environ.get(MAX_NORM_ENV_VAR, "") or 0.0)
+assert _MAX_NORM >= 0, f"{MAX_NORM_ENV_VAR}={_MAX_NORM}: a norm, 0 for no cap"
 EVERY_ENV_VAR = "MILES_SAMPLER_ADAPTER_EVERY"
 _EVERY = int(os.environ.get(EVERY_ENV_VAR, "") or 1)
 assert _EVERY >= 1, f"{EVERY_ENV_VAR}={_EVERY}: expected a positive number of steps"
@@ -423,15 +431,22 @@ def finish(rollout_id: int) -> None:
             for block in entry.get("blocks", ()):
                 _truncate(block, entry["offset"])
         offset2 += float(entry["offset"].square().sum())
+    cap_scale = 1.0
+    if _MAX_NORM and offset2 > _MAX_NORM**2:
+        cap_scale = _MAX_NORM / offset2**0.5
+        for entry in _state:
+            entry["offset"].mul_(cap_scale)
+        offset2 = _MAX_NORM**2
     _write(adapted=False)
     for stats in _input_stats:
         if stats.tokens:
             logger.info("sampler adapter input stats rollout=%d %s (this rank)", rollout_id, stats.line())
         stats.reset()
     logger.info(
-        "sampler adapter rollout=%d divergence_grad_norm=%.4e offset_norm=%.4e group_policy_grad_norm=%.4e (this rank)",
+        "sampler adapter rollout=%d divergence_grad_norm=%.4e offset_norm=%.4e group_policy_grad_norm=%.4e cap_scale=%.4e (this rank)",
         rollout_id,
         gradient2**0.5,
         offset2**0.5,
         policy2**0.5,
+        cap_scale,
     )
