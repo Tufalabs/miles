@@ -32,6 +32,14 @@ from miles.utils.types import RolloutBatch
 # here so that the terms built on the sampler's returned candidates (the head divergence, the sampler adapter)
 # can run with a policy gradient that is not centered.
 _PLAIN_PG = os.environ.get("MILES_SC_PLAIN_PG", "") == "1"
+# MILES_SC_PLAIN_PG_SIGN picks, per token, plain REINFORCE (score centered on the trainer's p) instead of the
+# sampler-centered score (q). On the logits the two differ by A (q - p), which moves the trainer toward the sampler
+# when A > 0 and away from it when A < 0. positive|negative: plain on the tokens whose advantage has that sign;
+# push: plain where it pushes the sampled token harder up (A > 0, p(a) < q(a)) or softer down (A < 0,
+# p(a) > q(a)), i.e. where A (q(a) - p(a)) > 0.
+_PLAIN_PG_SIGN = os.environ.get("MILES_SC_PLAIN_PG_SIGN", "")
+assert _PLAIN_PG_SIGN in ("", "positive", "negative", "push"), f"MILES_SC_PLAIN_PG_SIGN={_PLAIN_PG_SIGN}"
+assert not (_PLAIN_PG and _PLAIN_PG_SIGN), "MILES_SC_PLAIN_PG and MILES_SC_PLAIN_PG_SIGN are exclusive"
 
 
 def _candidate_log_probs(args: Namespace, batch: RolloutBatch, logits: torch.Tensor) -> dict[str, list[torch.Tensor]]:
@@ -223,6 +231,14 @@ def score_centering_loss_function(
     )
     if _PLAIN_PG:
         token_loss = -(advantages * torch.where(active, selected[:, 0], 0.0)).to(token_loss.dtype)
+    elif _PLAIN_PG_SIGN:
+        plain = -(advantages * torch.where(active, selected[:, 0], 0.0)).to(token_loss.dtype)
+        if _PLAIN_PG_SIGN == "push":
+            pick = advantages * (rollout - selected[:, 0].detach()) > 0
+        else:
+            pick = advantages > 0 if _PLAIN_PG_SIGN == "positive" else advantages < 0
+        pick = pick & active
+        token_loss = torch.where(pick, plain, token_loss)
     # Experiment hooks (LLMT-83): the gain penalty's passes replace or extend the token loss as they do for
     # plain policy gradient, and the dump steps save the per-token tensors.
     # The logit scale and the trainer-sampler logit error per prefix; logged at every step.
