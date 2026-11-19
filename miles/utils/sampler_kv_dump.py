@@ -10,6 +10,7 @@ MILES_SAMPLER_KV_DUMP=<dir>        where each finished request's K and V go, one
     the cache).
 MILES_SAMPLER_KV_DUMP_MAX=<n>      requests dumped per engine (default 64); capture stops after.
 MILES_SAMPLER_KV_DUMP_ROWS=<n>     tokens the host buffer holds per engine (default 60000); capture stops when full.
+MILES_SAMPLER_KV_DUMP_LAYERS=<n>   the model's layers (default 48, Qwen3-30B-A3B).
 
 What is captured: in Qwen3MoeAttention.forward_core, the k and v handed to the attention layer, after q/k norm,
 RoPE and (with MILES_SAMPLER_FAKE_INT_KV) the integer rounding, for every token of every forward, prefill and
@@ -32,6 +33,7 @@ logger = logging.getLogger(__name__)
 DIR = os.environ.get("MILES_SAMPLER_KV_DUMP", "")
 MAX = int(os.environ.get("MILES_SAMPLER_KV_DUMP_MAX", "") or 64)
 ROWS = int(os.environ.get("MILES_SAMPLER_KV_DUMP_ROWS", "") or 60000)
+LAYERS = int(os.environ.get("MILES_SAMPLER_KV_DUMP_LAYERS", "") or 48)
 
 _state: dict = {}
 _counts = {"dumped": 0, "skipped": 0, "forwards": 0}
@@ -44,30 +46,34 @@ def _stop(reason: str) -> None:
 
 
 def _init(attention, forward_batch) -> None:
-    pool = forward_batch.token_to_kv_pool
-    layers = int(getattr(pool, "layer_num", 0) or getattr(pool, "end_layer", 0) + 1)
     width = attention.num_kv_heads * attention.head_dim
     _state.update(
-        layers=layers,
+        layers=LAYERS,
         width=width,
-        k=torch.empty((layers, ROWS, width), dtype=torch.bfloat16, pin_memory=True),
-        v=torch.empty((layers, ROWS, width), dtype=torch.bfloat16, pin_memory=True),
-        map=torch.full((int(pool.size) + 65536,), -1, dtype=torch.int64, device=forward_batch.out_cache_loc.device),
+        k=torch.empty((LAYERS, ROWS, width), dtype=torch.bfloat16, pin_memory=True),
+        v=torch.empty((LAYERS, ROWS, width), dtype=torch.bfloat16, pin_memory=True),
+        map=torch.full((1 << 22,), -1, dtype=torch.int64, device=forward_batch.out_cache_loc.device),
         next=0,
         row0=0,
         n=0,
     )
     os.makedirs(DIR, exist_ok=True)
     logger.warning(
-        "sampler kv dump: on, %d layers, width %d, %d rows, pool %d slots, at most %d requests, into %s, pid %d",
-        layers,
+        "sampler kv dump: on, %d layers, width %d, %d rows, at most %d requests, into %s, pid %d",
+        LAYERS,
         width,
         ROWS,
-        int(pool.size),
         MAX,
         DIR,
         os.getpid(),
     )
+
+
+def _fit_map(loc: torch.Tensor) -> None:
+    top = int(loc.max()) + 1
+    if top > _state["map"].shape[0]:
+        grow = torch.full((top - _state["map"].shape[0] + (1 << 20),), -1, dtype=torch.int64, device=loc.device)
+        _state["map"] = torch.cat([_state["map"], grow])
 
 
 def capture(attention, k: torch.Tensor, v: torch.Tensor, forward_batch) -> None:
@@ -77,6 +83,9 @@ def capture(attention, k: torch.Tensor, v: torch.Tensor, forward_batch) -> None:
     if not _state:
         _init(attention, forward_batch)
     layer = attention.attn.layer_id
+    if layer >= LAYERS:
+        _stop(f"layer {layer} past MILES_SAMPLER_KV_DUMP_LAYERS={LAYERS}")
+        return
     loc = forward_batch.out_cache_loc
     n = k.shape[0]
     if loc is None or loc.shape[0] != n:
@@ -90,7 +99,8 @@ def capture(attention, k: torch.Tensor, v: torch.Tensor, forward_batch) -> None:
             _stop("host buffer full")
             return
         row0 = _state["next"]
-        _state["map"][loc.long()] = torch.arange(row0, row0 + n, device=loc.device)
+        _fit_map(loc)
+        _state["map"][loc.long()] =torch.arange(row0, row0 + n, device=loc.device)
         _state.update(row0=row0, n=n, next=row0 + n)
         _counts["forwards"] += 1
     elif n != _state["n"]:
