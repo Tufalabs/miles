@@ -49,6 +49,8 @@ rollout by rollout, for fitting the offset offline on replayed batches at a froz
 with update 1 takes the divergence pass and the offset's step at that lr and wd, one with update 0 only uses
 the offset (its logged KL is the KL with the current offset), and reset 1 sets the offset to zero first.
 Rollouts not listed are left alone (no update).
+MILES_SAMPLER_ADAPTER_LOAD=<rollout>:<file>,... sets the offset to an offsets file's before that rollout (the
+format MILES_SAMPLER_ADAPTER_INIT reads); a plan's reset at the same rollout comes first.
 MILES_SAMPLER_ADAPTER_SAVE_AT=<rollout>,... with MILES_SAMPLER_ADAPTER_SAVE_DIR=<dir> writes the offset after each
 listed rollout's step, as an offsets file ({"names", "offsets"}, the format MILES_SAMPLER_ADAPTER_INIT reads),
 <dir>/offsets_<rollout>.pt, from the first rank (every rank holds the same offset of the attention group).
@@ -105,6 +107,7 @@ PLAN_ENV_VAR = "MILES_SAMPLER_ADAPTER_PLAN"
 _FORWARD_ONLY = os.environ.get("MILES_SAMPLER_ADAPTER_FORWARD_ONLY", "") == "1"
 _SAVE_AT = {int(r) for r in os.environ.get("MILES_SAMPLER_ADAPTER_SAVE_AT", "").split(",") if r.strip()}
 _SAVE_DIR = os.environ.get("MILES_SAMPLER_ADAPTER_SAVE_DIR", "")
+_LOAD = {int(e.split(":", 1)[0]): e.split(":", 1)[1] for e in os.environ.get("MILES_SAMPLER_ADAPTER_LOAD", "").split(",") if e.strip()}
 assert not _SAVE_AT or _SAVE_DIR, "MILES_SAMPLER_ADAPTER_SAVE_AT needs MILES_SAMPLER_ADAPTER_SAVE_DIR"
 _PLAN: dict[int, tuple[bool, float, float, bool]] = {}
 for _entry in filter(None, (part.strip() for part in os.environ.get(PLAN_ENV_VAR, "").split(","))):
@@ -424,6 +427,12 @@ def measure(
     if plan is not None and plan[3]:
         for entry in _state:
             entry["offset"].zero_()
+    if rollout_id in _LOAD:
+        saved = torch.load(_LOAD[rollout_id], map_location="cpu", weights_only=True)
+        assert saved["names"] == [entry["name"] for entry in _state], f"{_LOAD[rollout_id]} holds other parameters"
+        for entry, offset in zip(_state, saved["offsets"], strict=True):
+            entry["offset"].copy_(offset)
+        logger.info("sampler adapter: rollout %d starts from the offsets in %s", rollout_id, _LOAD[rollout_id])
     _write(adapted=True)
     global _first_rollout
     if _first_rollout is None:

@@ -8,7 +8,9 @@ whose sampler routing came from decode forwards) and prompt tokens (prefill).
 MILES_ROUTING_REPLAY_ROLLOUTS=<id>,...  the rollouts whose forward uses the sampler's routing; the others use the
 trainer's own (default: all replayed, as --use-rollout-routing-replay alone does).
 The score-centering loss adds, per rollout, the head KL of generated tokens at positions where any layer flipped
-against the rest. Each rank logs its running totals after every micro-batch: "routing flips rollout=<id> {json}"
+against the rest, and binned by the number of layers that flipped at the position (0, 1, 2-3, 4-7, 8-15, 16+) and by
+the swapped gate mass there (the trainer's router probability, summed over layers, on its experts that the sampler
+did not pick: 0, up to 0.01, 0.03, 0.1, 0.3, above). Each rank logs its running totals after every micro-batch: "routing flips rollout=<id> {json}"
 with, per layer, [generated tokens, flipped, prompt tokens, flipped], and kl_flip/kl_all/n_flip/n_all.
 """
 
@@ -56,8 +58,14 @@ def set_batch(total_lengths, response_lengths) -> None:
     _batch.update(generated=generated, flip=None, total_lengths=[int(t) for t in total_lengths], response_lengths=[int(r) for r in response_lengths])
 
 
-def record(layer: int, own: torch.Tensor, sampler: torch.Tensor) -> None:
-    """own, sampler: [tokens, k] expert ids of one MoE layer for the packed micro-batch (padding: -1)."""
+COUNT_BINS = (0, 1, 2, 4, 8, 16)
+MASS_BINS = (0.0, 0.01, 0.03, 0.1, 0.3)
+
+
+def record(layer: int, own: torch.Tensor, sampler: torch.Tensor, scores: torch.Tensor | None = None) -> None:
+    """own, sampler: [tokens, k] expert ids of one MoE layer for the packed micro-batch (padding: -1); scores: the
+    router's scores [tokens, experts] (probabilities, or logits that are softmaxed here), for the swapped gate mass:
+    the trainer's probability on its own experts that the sampler did not pick."""
     if not _batch:
         return
     own, sampler = own.reshape(-1, own.shape[-1]), sampler.reshape(-1, sampler.shape[-1])
@@ -78,6 +86,26 @@ def record(layer: int, own: torch.Tensor, sampler: torch.Tensor) -> None:
     entry[2] += int(prompt.sum())
     entry[3] += int((flip & prompt).sum())
     _batch["flip"] = flip if _batch["flip"] is None else (_batch["flip"] | flip)
+    count = flip.to(torch.int32)
+    _batch["count"] = count if _batch.get("count") is None else _batch["count"] + count
+    if scores is not None:
+        probs = scores.reshape(own.shape[0], -1).float()
+        # the patched top-k may receive the score function's output (probabilities) or raw logits
+        if bool((probs < 0).any()) or not torch.allclose(probs.sum(-1), torch.ones_like(probs[:, 0]), atol=1e-2):
+            probs = torch.softmax(probs, dim=-1)
+        picked = (own.unsqueeze(-1) == sampler.unsqueeze(-2)).any(-1)
+        mass = (probs.gather(1, own.clamp_min(0).long()) * (~picked).float()).sum(-1) * flip.float()
+        _batch["mass"] = mass if _batch.get("mass") is None else _batch["mass"] + mass
+
+
+def _per_response(values: torch.Tensor, device) -> torch.Tensor:
+    values = values.to(device)
+    out, start = [], 0
+    for total, response in zip(_batch["total_lengths"], _batch["response_lengths"], strict=True):
+        first = start + total - response - 1
+        out.append(values[first : first + response])
+        start += total
+    return torch.cat(out)
 
 
 def response_flips(device) -> torch.Tensor | None:
@@ -85,13 +113,7 @@ def response_flips(device) -> torch.Tensor | None:
     forward predicts it."""
     if not _batch or _batch["flip"] is None:
         return None
-    flip = _batch["flip"].to(device)
-    out, start = [], 0
-    for total, response in zip(_batch["total_lengths"], _batch["response_lengths"], strict=True):
-        first = start + total - response - 1
-        out.append(flip[first : first + response])
-        start += total
-    return torch.cat(out)
+    return _per_response(_batch["flip"], device)
 
 
 def add_kl(per_token_kl: torch.Tensor, active: torch.Tensor) -> None:
@@ -101,6 +123,21 @@ def add_kl(per_token_kl: torch.Tensor, active: torch.Tensor) -> None:
     if flips is None or rollout not in _totals or flips.shape[0] != per_token_kl.shape[0]:
         return
     kl = per_token_kl.detach().float() * active
+    binned = _totals[rollout].setdefault("bins", {"count": [[0.0, 0] for _ in COUNT_BINS], "mass": [[0.0, 0] for _ in range(len(MASS_BINS) + 1)]})
+    count = _per_response(_batch["count"], kl.device)
+    for i, low in enumerate(COUNT_BINS):
+        high = COUNT_BINS[i + 1] if i + 1 < len(COUNT_BINS) else 10**9
+        sel = (count >= low) & (count < high) & active.bool()
+        binned["count"][i][0] += float(kl[sel].sum())
+        binned["count"][i][1] += int(sel.sum())
+    if _batch.get("mass") is not None:
+        mass = _per_response(_batch["mass"], kl.device)
+        edges = [0.0, *MASS_BINS[1:], float("inf")]
+        selections = [mass <= 0] + [(mass > edges[i]) & (mass <= edges[i + 1]) for i in range(len(edges) - 1)]
+        for i, sel in enumerate(selections):
+            sel = sel & active.bool()
+            binned["mass"][i][0] += float(kl[sel].sum())
+            binned["mass"][i][1] += int(sel.sum())
     totals = _totals[rollout]["kl"]
     totals[0] += float(kl[flips].sum())
     totals[1] += float(kl.sum())
@@ -111,5 +148,5 @@ def add_kl(per_token_kl: torch.Tensor, active: torch.Tensor) -> None:
         "routing flips rollout=%d replay=%d %s",
         rollout,
         int(use_replay()),
-        json.dumps({"layers": totals_out["layers"], "kl_flip": totals[0], "kl_all": totals[1], "n_flip": totals[2], "n_all": totals[3]}),
+        json.dumps({"layers": totals_out["layers"], "kl_flip": totals[0], "kl_all": totals[1], "n_flip": totals[2], "n_all": totals[3], "bins": totals_out.get("bins")}),
     )
