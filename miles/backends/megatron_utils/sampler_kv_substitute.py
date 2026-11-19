@@ -13,7 +13,7 @@ MILES_KV_SUBSTITUTE=<rollout>:<mode>[:<dump>],...  what each rollout's training 
 MILES_KV_SUBSTITUTE_DIRS=<dump>=<dir>,...  the dump directories (sampler_kv_dump.py's files, named by the SHA-1
     of a sequence's token ids). A sequence with no file keeps its own K and V; the first n = len - 1 positions
     of a sequence with one are replaced, the last token (never in the sampler's cache) keeps its own.
-Each fetch step logs, for its first micro-batch and per layer, how far the sampler's K and V are from the
+Each fetch step logs, for its first micro-batch with a dump and per layer, how far the sampler's K and V are from the
 trainer's rounded the same way (relative RMS, overall and by position), and how many sequences were found.
 Needs packed sequences (qkv_format thd), tensor- and context-parallel size 1.
 """
@@ -21,7 +21,6 @@ Needs packed sequences (qkv_format thd), tensor- and context-parallel size 1.
 import hashlib
 import logging
 import os
-import re
 
 import numpy as np
 import torch
@@ -40,6 +39,7 @@ _dirs: dict[str, str] = {}
 _index: dict[str, dict[str, str]] = {}
 _batch: dict = {}
 _logged: set[tuple[int, int]] = set()
+_totals: dict[int, tuple[int, int]] = {}
 
 
 def enabled() -> bool:
@@ -112,8 +112,12 @@ def set_batch(unconcat_tokens) -> None:
         assert record["tokens"] == tokens.tolist(), f"{path}: tokens differ from the sequence with the same hash"
         found.append(record)
     _batch["records"] = found
-    _batch["first"] = (rollout, 0) not in _logged
-    _logged.add((rollout, 0))
+    hits = sum(record is not None for record in found)
+    _totals[rollout] = (_totals.get(rollout, (0, 0))[0] + hits, _totals.get(rollout, (0, 0))[1] + len(found))
+    logger.info("kv substitute rollout=%d sequences found so far %d/%d", rollout, *_totals[rollout])
+    _batch["first"] = hits > 0 and (rollout, 0) not in _logged
+    if _batch["first"]:
+        _logged.add((rollout, 0))
 
 
 def _replace(x: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -196,7 +200,7 @@ def maybe_install(model_chunks) -> None:
     for chunk in model_chunks:
         for name, module in chunk.named_modules():
             if name.endswith("self_attention") and hasattr(module, "core_attention"):
-                _wrap(module.core_attention, int(re.search(r"(?:^|\.)layers\.(\d+)\.", name).group(1)))
+                _wrap(module.core_attention, int(name.split(".layers.")[1].split(".")[0]))
                 wrapped += 1
     assert wrapped > 0, f"{ENV_VAR} is set but no self_attention.core_attention module was found"
     logger.info("kv substitute installed in %d layers: %s, dumps %s", wrapped, _schedule, _dirs)
