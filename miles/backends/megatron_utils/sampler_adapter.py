@@ -49,6 +49,9 @@ rollout by rollout, for fitting the offset offline on replayed batches at a froz
 with update 1 takes the divergence pass and the offset's step at that lr and wd, one with update 0 only uses
 the offset (its logged KL is the KL with the current offset), and reset 1 sets the offset to zero first.
 Rollouts not listed are left alone (no update).
+MILES_SAMPLER_ADAPTER_SAVE_AT=<rollout>,... with MILES_SAMPLER_ADAPTER_SAVE_DIR=<dir> writes the offset after each
+listed rollout's step, as an offsets file ({"names", "offsets"}, the format MILES_SAMPLER_ADAPTER_INIT reads),
+<dir>/offsets_<rollout>.pt, from the first rank (every rank holds the same offset of the attention group).
 MILES_SAMPLER_ADAPTER_FORWARD_ONLY=1 (with a plan, at policy learning rate 0) runs the policy pass forward
 only, without its backward and the optimizer step: an eval rollout computes its KL, a fit rollout its
 divergence pass (forward and backward on the offset) and the forward. The offset's step is unchanged.
@@ -100,6 +103,9 @@ _WARMUP = int(os.environ.get(WARMUP_ENV_VAR, "") or 0)
 _first_rollout = None  # the id of the first rollout this process trains on (a resumed run starts later)
 PLAN_ENV_VAR = "MILES_SAMPLER_ADAPTER_PLAN"
 _FORWARD_ONLY = os.environ.get("MILES_SAMPLER_ADAPTER_FORWARD_ONLY", "") == "1"
+_SAVE_AT = {int(r) for r in os.environ.get("MILES_SAMPLER_ADAPTER_SAVE_AT", "").split(",") if r.strip()}
+_SAVE_DIR = os.environ.get("MILES_SAMPLER_ADAPTER_SAVE_DIR", "")
+assert not _SAVE_AT or _SAVE_DIR, "MILES_SAMPLER_ADAPTER_SAVE_AT needs MILES_SAMPLER_ADAPTER_SAVE_DIR"
 _PLAN: dict[int, tuple[bool, float, float, bool]] = {}
 for _entry in filter(None, (part.strip() for part in os.environ.get(PLAN_ENV_VAR, "").split(","))):
     _rollout, _update, _lr, _wd, _reset = _entry.split(":")
@@ -468,6 +474,11 @@ def finish(rollout_id: int) -> None:
             entry["offset"].mul_(cap_scale)
         offset2 = _MAX_NORM**2
     _write(adapted=False)
+    if rollout_id in _SAVE_AT and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0):
+        os.makedirs(_SAVE_DIR, exist_ok=True)
+        target = os.path.join(_SAVE_DIR, f"offsets_{rollout_id}.pt")
+        torch.save({"names": [entry["name"] for entry in _state], "offsets": [entry["offset"].cpu() for entry in _state]}, target)
+        logger.info("sampler adapter: offset after rollout %d saved to %s", rollout_id, target)
     for stats in _input_stats:
         if stats.tokens:
             logger.info("sampler adapter input stats rollout=%d %s (this rank)", rollout_id, stats.line())
