@@ -527,6 +527,10 @@ def run_forward_backward_pass(
             sampler_kv_substitute.set_batch(batch["unconcat_tokens"])
         if sampler_act_compare.enabled():
             sampler_act_compare.set_batch(batch["unconcat_tokens"])
+        from miles.utils import routing_flip_stats
+
+        if routing_flip_stats.enabled():
+            routing_flip_stats.set_batch(batch["total_lengths"], batch["response_lengths"])
 
         from miles.utils.replay_base import all_replay_managers
 

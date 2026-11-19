@@ -138,6 +138,16 @@ class BaseReplayManager:
                 return result
 
             elif stage == "replay_forward":
+                from miles.utils import routing_flip_stats
+
+                if routing_flip_stats.enabled():
+                    # LLMT-83 probe: compare the trainer's own routing with the sampler's; use either
+                    own = old_topk_fn(scores, topk, *args, **kwargs)
+                    sampler = replay.pop_forward()
+                    routing_flip_stats.record(manager.replays.index(replay), own[1] if isinstance(own, tuple) else own, sampler)
+                    if not routing_flip_stats.use_replay():
+                        return own
+                    return _get_replay_result(sampler, scores, topk, *args, **kwargs)
                 return _get_replay_result(replay.pop_forward(), scores, topk, *args, **kwargs)
 
             elif stage == "replay_backward":

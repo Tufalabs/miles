@@ -19,6 +19,7 @@ MILES_SAMPLER_ACT_DUMP_SELECT=<k>  only requests whose rid's SHA-1 is 0 mod k (d
     dumped answers are not just the ones that finish first.
 MILES_SAMPLER_ACT_DUMP_ROWS=<n>    decode tokens the host buffer holds per engine (default 12000).
 MILES_SAMPLER_ACT_DUMP_LAYERS=<n>  layers (default 48).
+MILES_SAMPLER_ACT_DUMP_STRIDE=<s>  only tokens at positions that are multiples of s (default 1, all).
 Needs eager decode (--sglang-disable-cuda-graph): a captured CUDA graph replays without this Python.
 """
 
@@ -36,6 +37,7 @@ MAX = int(os.environ.get("MILES_SAMPLER_ACT_DUMP_MAX", "") or 8)
 ROWS = int(os.environ.get("MILES_SAMPLER_ACT_DUMP_ROWS", "") or 12000)
 LAYERS = int(os.environ.get("MILES_SAMPLER_ACT_DUMP_LAYERS", "") or 48)
 SELECT = int(os.environ.get("MILES_SAMPLER_ACT_DUMP_SELECT", "") or 1)
+STRIDE = int(os.environ.get("MILES_SAMPLER_ACT_DUMP_STRIDE", "") or 1)
 
 _state: dict = {}
 _by_idx: dict[int, list[int]] = {}
@@ -82,17 +84,22 @@ def layer_input(layer, hidden: torch.Tensor, forward_batch) -> None:
     if indices is None or positions is None or indices.shape[0] != n or positions.shape[0] != n:
         _stop(f"decode batch of {n} tokens without one request index and position each")
         return
-    if _state["next"] + n > ROWS:
+    indices, positions = indices.cpu().numpy(), positions.cpu().numpy()
+    keep = np.nonzero(positions % STRIDE == 0)[0]
+    kept = len(keep)
+    if kept == 0:
+        return
+    if _state["next"] + kept > ROWS:
         _stop("host buffer full")
         return
     row0 = _state["next"]
-    indices, positions = indices.cpu().numpy(), positions.cpu().numpy()
-    _state["idx"][row0 : row0 + n] = indices
-    _state["pos"][row0 : row0 + n] = positions
-    for offset, idx in enumerate(indices.tolist()):
+    _state["idx"][row0 : row0 + kept] = indices[keep]
+    _state["pos"][row0 : row0 + kept] = positions[keep]
+    for offset, idx in enumerate(indices[keep].tolist()):
         _by_idx.setdefault(int(idx), []).append(row0 + offset)
-    _state["emb"][row0 : row0 + n].copy_(hidden.reshape(n, -1), non_blocking=True)
-    _state.update(row0=row0, n=n, next=row0 + n)
+    keep_t = torch.as_tensor(keep, device=hidden.device)
+    _state["emb"][row0 : row0 + kept].copy_(hidden.reshape(n, -1)[keep_t], non_blocking=True)
+    _state.update(row0=row0, n=n, kept=kept, keep=keep_t, next=row0 + kept)
     _counts["forwards"] += 1
 
 
@@ -105,7 +112,7 @@ def capture(layer, kind: str, hidden: torch.Tensor, forward_batch) -> None:
     if not torch.is_tensor(hidden) or hidden.shape[0] != n or layer.layer_id >= LAYERS:
         _stop(f"layer {layer.layer_id} {kind}: {type(hidden).__name__} {getattr(hidden, 'shape', None)} for {n} tokens")
         return
-    _state[kind][layer.layer_id, row0 : row0 + n].copy_(hidden.reshape(n, -1), non_blocking=True)
+    _state[kind][layer.layer_id, row0 : row0 + _state["kept"]].copy_(hidden.reshape(n, -1)[_state["keep"]], non_blocking=True)
 
 
 def on_release(req, tree_cache) -> None:
@@ -123,7 +130,7 @@ def on_release(req, tree_cache) -> None:
         return
     output = list(getattr(req, "output_ids_through_stop", None) or req.output_ids)
     tokens = list(req.origin_input_ids) + output
-    wanted = list(range(len(req.origin_input_ids), len(tokens) - 1))
+    wanted = [p for p in range(len(req.origin_input_ids), len(tokens) - 1) if p % STRIDE == 0]
     if not wanted:
         return
     latest = {}

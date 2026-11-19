@@ -211,6 +211,14 @@ def score_centering_loss_function(
     ids = _local_candidates(args, batch, "rollout_topk_token_ids", logits.device)
     head = _local_candidates(args, batch, "rollout_topk_log_probs", logits.device)
     head_mask = (ids >= 0) & active.unsqueeze(-1)
+    from miles.utils import routing_flip_stats
+
+    if routing_flip_stats.enabled():
+        # LLMT-83 probe: the head KL per token, split at positions where the routing flipped
+        train_head = selected[:, 1:].detach().float()
+        safe_head = torch.where(head_mask, head.float(), 0.0)
+        per_token = torch.where(head_mask, safe_head.exp() * (safe_head - train_head), 0.0).sum(-1)
+        routing_flip_stats.add_kl(per_token, active.float())
     # Experiment (LLMT-83): log, and optionally remove, the update's first-order push on the trainer-sampler KL.
     advantages, kl_metrics = score_centering_kl_neutral.adjust(
         advantages, selected[:, 0], selected[:, 1:], rollout, head, head_mask, active, sum_of_sample_mean
