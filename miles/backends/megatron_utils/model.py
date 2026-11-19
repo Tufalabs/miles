@@ -89,7 +89,7 @@ from .freeze_params import maybe_zero_frozen_grads
 from . import sampler_adapter
 from .gain_projection import penalty_gradient, project_out_penalty_gradient
 from .grad_sketch import maybe_save_grad_sketch
-from . import sampler_kv_substitute
+from . import sampler_kv_substitute, sampler_mismatch_emulation
 from .sampler_emulation import maybe_install_sampler_emulation
 from .lora.bridge import _ensure_model_list, _setup_lora_model_via_bridge  # noqa: F401
 
@@ -194,6 +194,7 @@ def setup_model_and_optimizer(
     if role == "actor":
         maybe_install_sampler_emulation(model)
         sampler_kv_substitute.maybe_install(model)
+        sampler_mismatch_emulation.maybe_install(model)
 
     if args.debug_disable_optimizer:
         if is_first_replica_megatron_main_rank():
@@ -642,6 +643,7 @@ def train_one_step(
         fn_args = compute_custom_function_config(args, x)
         custom_before_train_step_hook(fn_args, rollout_id, step_id, model, optimizer, opt_param_scheduler)
 
+    sampler_mismatch_emulation.before_train_step(rollout_id)
     with training_rollout_scope(rollout_id):
         if sampler_adapter.enabled():
             sampler_adapter.measure(
