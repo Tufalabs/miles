@@ -15,7 +15,9 @@ MILES_MISMATCH_EMULATION=<rollout>:<part>[+<part>...],...  parts:
 Weights: before each train step the targeted parameters are set to the quantized originals of the step's part,
 or back to the originals on a step without one. The originals are copied on the GPU at the first use; that holds
 only while the policy does not train (learning rate 0), which is what this is for. Rollouts not listed get no
-part. K and V emulation is MILES_KV_SUBSTITUTE's (emul_nvfp4, emul_int4g64).
+part. K and V emulation is MILES_KV_SUBSTITUTE's (emul_nvfp4, emul_int4g64). With
+MILES_SAMPLER_ADAPTER_FORWARD_ONLY=1 no optimizer step writes the weights back, so they are put in place only
+when the step's weight part changes.
 """
 
 import logging
@@ -27,6 +29,7 @@ import torch
 logger = logging.getLogger(__name__)
 
 ENV_VAR = "MILES_MISMATCH_EMULATION"
+_KEEP = os.environ.get("MILES_SAMPLER_ADAPTER_FORWARD_ONLY", "") == "1"
 PARTS = ("w_fp8", "w_int8", "w_int4", "a_int8")
 _WEIGHT = re.compile(r"(self_attention\.linear_(qkv|proj)\.weight|mlp\.experts\.linear_fc[12]\.weight\d*)$")
 _ACT_MODULE = re.compile(r"(self_attention\.linear_proj|mlp\.experts\.linear_fc[12])$")
@@ -88,6 +91,8 @@ def before_train_step(rollout_id: int) -> None:
     weights = next((part for part in parts if part.startswith("w_")), None)
     _state["act"] = "a_int8" in parts
     if weights is None and _state["weights"] is None:
+        return
+    if _KEEP and weights == _state["weights"]:
         return
     if not _originals:
         _originals.extend(param.detach().clone() for _, param in _params)

@@ -49,6 +49,9 @@ rollout by rollout, for fitting the offset offline on replayed batches at a froz
 with update 1 takes the divergence pass and the offset's step at that lr and wd, one with update 0 only uses
 the offset (its logged KL is the KL with the current offset), and reset 1 sets the offset to zero first.
 Rollouts not listed are left alone (no update).
+MILES_SAMPLER_ADAPTER_FORWARD_ONLY=1 (with a plan, at policy learning rate 0) runs the policy pass forward
+only, without its backward and the optimizer step: an eval rollout computes its KL, a fit rollout its
+divergence pass (forward and backward on the offset) and the forward. The offset's step is unchanged.
 
 MILES_SAMPLER_ADAPTER_RANK=<r> keeps the offset of every matrix in the group at rank r: after each step the
 offset is replaced by its rank-r approximation (`_truncate`). The q, k and v rows of a linear_qkv weight are
@@ -96,6 +99,7 @@ WARMUP_ENV_VAR = "MILES_SAMPLER_ADAPTER_WARMUP"
 _WARMUP = int(os.environ.get(WARMUP_ENV_VAR, "") or 0)
 _first_rollout = None  # the id of the first rollout this process trains on (a resumed run starts later)
 PLAN_ENV_VAR = "MILES_SAMPLER_ADAPTER_PLAN"
+_FORWARD_ONLY = os.environ.get("MILES_SAMPLER_ADAPTER_FORWARD_ONLY", "") == "1"
 _PLAN: dict[int, tuple[bool, float, float, bool]] = {}
 for _entry in filter(None, (part.strip() for part in os.environ.get(PLAN_ENV_VAR, "").split(","))):
     _rollout, _update, _lr, _wd, _reset = _entry.split(":")
@@ -232,6 +236,11 @@ class _InputStats:
                 out.append(f"{label}_{part}_const={float(mean[rows].square().sum() / mean2[rows].sum()):.4f}")
                 out.append(f"{label}_{part}_rms={float(mean2[rows].mean().sqrt()):.4e}")
         return " ".join(out)
+
+
+def plan_forward_only() -> bool:
+    """Whether the policy pass runs forward only (MILES_SAMPLER_ADAPTER_FORWARD_ONLY with a plan)."""
+    return _FORWARD_ONLY and bool(_PLAN)
 
 
 def enabled() -> bool:

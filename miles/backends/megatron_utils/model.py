@@ -634,6 +634,11 @@ def train_one_step(
     parallel_state = get_parallel_state()
     dumper_phase_util = DumperMegatronUtil(args, model, DumperPhase.FWD_BWD, rollout_id=rollout_id)
     disable_optimizer = args.debug_disable_optimizer or optimizer is None
+    # Offline fit of the sampler adapter at a frozen policy: the policy pass forward only, no optimizer step.
+    replay_forward_only = sampler_adapter.enabled() and sampler_adapter.plan_forward_only()
+    if replay_forward_only:
+        assert args.backend.lr == 0, "MILES_SAMPLER_ADAPTER_FORWARD_ONLY needs policy learning rate 0"
+        disable_optimizer = True
     if args.enable_sample_ownership_checker:
         sample_consumption_start = data_iterator[0].offset
     _zero_grads(model, optimizer, disable_optimizer)
@@ -671,7 +676,7 @@ def train_one_step(
                 num_microbatches,
             )
         losses_reduced = run_forward_backward_pass(
-            args, dumper_phase_util, data_iterator, model, num_microbatches, num_rollouts
+            args, dumper_phase_util, data_iterator, model, num_microbatches, num_rollouts, forward_only=replay_forward_only
         )
     if gain_penalty_grads is not None:
         project_out_penalty_gradient(model, gain_penalty_grads, rollout_id)
